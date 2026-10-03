@@ -84,10 +84,11 @@ class LoginWorker(threading.Thread):
 
 
 class DownloadWorker(threading.Thread):
-    def __init__(self, api_id, api_hash, chat, out_dir, limit, q):
+    def __init__(self, api_id, api_hash, chat, out_dir, limit, workers, q):
         super().__init__(daemon=True)
         self.api_id, self.api_hash = api_id, api_hash
-        self.chat, self.out_dir, self.limit, self.q = chat, out_dir, limit, q
+        self.chat, self.out_dir, self.limit = chat, out_dir, limit
+        self.workers, self.q = workers, q
         self.cancel = False
 
     def run(self):
@@ -97,9 +98,11 @@ class DownloadWorker(threading.Thread):
                 self.api_id, self.api_hash, self.chat, self.out_dir, self.limit,
                 log=lambda t: self.q.put(("log", t)),
                 on_scan=lambda n: self.q.put(("scan", n)),
-                on_found=lambda n: self.q.put(("found", n)),
-                on_dl=lambda i, n, name, cur, tot: self.q.put(("dl", i, n, name, cur, tot)),
+                on_found=lambda n, tb: self.q.put(("found", n, tb)),
+                on_progress=lambda df, tf, bd, tb, name: self.q.put(
+                    ("dl", df, tf, bd, tb, name)),
                 cancelled=lambda: self.cancel,
+                workers=self.workers,
             ))
             self.q.put(("done", ok, skip, fail))
         except Exception as e:
@@ -193,8 +196,13 @@ class App:
         ttk.Spinbox(df, from_=0, to=10 ** 9, textvariable=self.limit_var, width=10).grid(row=2, column=1, sticky="w")
         ttk.Label(df, text="0 = 扫描全部历史消息", foreground="#888").grid(row=2, column=2, sticky="w")
 
+        ttk.Label(df, text="并行连接:").grid(row=3, column=0, sticky="e")
+        self.workers_var = tk.IntVar(value=4)
+        ttk.Spinbox(df, from_=1, to=8, textvariable=self.workers_var, width=10).grid(row=3, column=1, sticky="w")
+        ttk.Label(df, text="条数越多越快，但太大容易触发限流", foreground="#888").grid(row=3, column=2, sticky="w")
+
         brow = ttk.Frame(df)
-        brow.grid(row=3, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        brow.grid(row=4, column=0, columnspan=3, sticky="we", pady=(6, 0))
         self.start_btn = ttk.Button(brow, text="开始下载 PDF", command=self.on_start, state="disabled")
         self.start_btn.pack(side="left")
         self.cancel_btn = ttk.Button(brow, text="取消", command=self.on_cancel, state="disabled")
@@ -202,9 +210,9 @@ class App:
         ttk.Button(brow, text="打开下载目录", command=self.on_open_dir).pack(side="left")
 
         self.progress = ttk.Progressbar(df, maximum=100)
-        self.progress.grid(row=4, column=0, columnspan=3, sticky="we", pady=(8, 2))
+        self.progress.grid(row=5, column=0, columnspan=3, sticky="we", pady=(8, 2))
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(df, textvariable=self.status_var, foreground="#333").grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(df, textvariable=self.status_var, foreground="#333").grid(row=6, column=0, columnspan=3, sticky="w")
 
         # ---------- 日志 ----------
         lf2 = ttk.LabelFrame(main, text="日志", padding=4)
@@ -238,6 +246,10 @@ class App:
             self.limit_var.set(int(cfg.get("limit", 0) or 0))
         except (TypeError, ValueError):
             pass
+        try:
+            self.workers_var.set(int(cfg.get("workers", 4) or 4))
+        except (TypeError, ValueError):
+            self.workers_var.set(4)
         p = cfg.get("proxy") or {}
         if p.get("host"):
             self.proxy_var.set(f"{p['host']}:{p.get('port', '')}")
@@ -259,6 +271,7 @@ class App:
         cfg["out_dir"] = self.out_var.get().strip()
         cfg["chat"] = self.chat_var.get().strip()
         cfg["limit"] = self.limit_var.get()
+        cfg["workers"] = self.workers_var.get()
         try:
             proxy = core.parse_proxy_text(self.proxy_var.get())
         except ValueError as e:
@@ -329,7 +342,8 @@ class App:
         if not self._save_config():
             return
         self._set_busy("download")
-        self.worker = DownloadWorker(api_id, self.api_hash_var.get().strip(), chat, out, limit, self.q)
+        self.worker = DownloadWorker(api_id, self.api_hash_var.get().strip(), chat,
+                                     out, limit, self.workers_var.get(), self.q)
         self.worker.start()
 
     def on_cancel(self):
@@ -387,13 +401,15 @@ class App:
         elif kind == "scan":
             self.status_var.set(f"已扫描 {item[1]} 条消息…")
         elif kind == "found":
+            n, total_bytes = item[1], item[2]
             self.progress.config(value=0)
-            self.status_var.set(f"找到 {item[1]} 个 PDF，开始下载…")
+            self.status_var.set(f"找到 {n} 个 PDF（{core.human_size(total_bytes)}），开始并行下载…")
         elif kind == "dl":
-            i, n, name, cur, tot = item[1:]
-            pct = ((i - 1) + (cur / tot if tot else 1)) / n * 100
+            df, tf, bd, tb, name = item[1:]
+            pct = bd / tb * 100 if tb else 100
             self.progress.config(value=min(pct, 100))
-            self.status_var.set(f"下载 {i}/{n}：{name}（{core.human_size(cur)} / {core.human_size(tot)}）")
+            self.status_var.set(
+                f"[{df}/{tf}] {core.human_size(bd)} / {core.human_size(tb)} · {name}")
         elif kind == "done":
             ok, skip, fail = item[1:]
             self._append_log(f"全部完成：成功 {ok}，跳过 {skip}，失败 {fail}")

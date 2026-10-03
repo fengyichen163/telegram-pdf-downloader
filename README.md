@@ -61,7 +61,7 @@ python pdf_downloader_cli.py @channel_name
 python pdf_downloader_cli.py t.me/xxxx -o D:\pdfs -n 2000
 ```
 
-`-n` 限制最多扫描多少条消息（默认 0 = 全部历史）。
+`-n` 限制最多扫描多少条消息（默认 0 = 全部历史）；`-w` 设置并行下载连接数（默认 4，1~8 可调）。下载使用多条并行连接，绕开 Telegram 免费账号的单连接限速。
 
 ## 常见问题
 

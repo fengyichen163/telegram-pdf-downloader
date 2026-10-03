@@ -61,19 +61,26 @@ async def run(args, api_id, api_hash, phone):
         api_id, api_hash, args.chat, args.out, args.limit,
         log=print,
         on_scan=lambda n: print(f"\r已扫描 {n} 条消息…", end="", flush=True),
-        on_found=lambda n: print(f"\n找到 {n} 个 PDF，开始下载…"),
-        on_dl=lambda i, n, name, cur, tot: print(
-            f"\r[{i}/{n}] {name} {core.human_size(cur)}/{core.human_size(tot)}   ",
+        on_found=lambda n, tb: print(
+            f"\n找到 {n} 个 PDF（{core.human_size(tb)}），{args.workers} 条连接并行下载…"),
+        on_progress=lambda df, tf, bd, tb, name: print(
+            f"\r[{df}/{tf}] {core.human_size(bd)}/{core.human_size(tb)} {name[:40]}   ",
             end="", flush=True),
         cancelled=lambda: False,
+        workers=args.workers,
     )
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="Telegram 群/频道 PDF 批量下载器")
     ap.add_argument("chat", nargs="?", help="群/频道：@用户名、t.me/链接 或 数字 ID")
     ap.add_argument("-o", "--out", default=core.DEFAULT_OUT, help="输出目录（默认：下载文件夹）")
     ap.add_argument("-n", "--limit", type=int, default=0, help="最多扫描的消息数，0=全部")
+    ap.add_argument("-w", "--workers", type=int, default=4, help="并行下载连接数（1-8，默认 4）")
     ap.add_argument("--api-id", type=int, help="my.telegram.org 的 api_id（也可写入 config.json）")
     ap.add_argument("--api-hash", help="my.telegram.org 的 api_hash")
     ap.add_argument("--phone", help="手机号（国际格式，如 +8613800138000）")
@@ -91,7 +98,8 @@ def main():
         api_hash = api_hash or input("api_hash: ").strip()
     api_id = int(api_id)
     save_cfg({"api_id": api_id, "api_hash": api_hash, "phone": phone,
-              "out_dir": args.out, "chat": args.chat, "limit": args.limit})
+              "out_dir": args.out, "chat": args.chat, "limit": args.limit,
+              "workers": args.workers})
 
     try:
         ok, skip, fail = asyncio.run(run(args, api_id, api_hash, phone))
