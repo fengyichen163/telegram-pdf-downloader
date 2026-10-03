@@ -233,16 +233,18 @@ class App:
         frow = ttk.Frame(df)
         frow.grid(row=0, column=0, sticky="we")
         ttk.Label(frow, text="格式:").pack(side="left")
-        self.ext_var = tk.StringVar()
-        ext_e = ttk.Entry(frow, textvariable=self.ext_var, width=16)
-        ext_e.pack(side="left", padx=(2, 8))
+        self._ext_map = {"全部格式": None}
+        self.ext_var = tk.StringVar(value="全部格式")
+        self.ext_box = ttk.Combobox(frow, textvariable=self.ext_var, width=14,
+                                    state="readonly", values=["全部格式"])
+        self.ext_box.pack(side="left", padx=(2, 8))
+        self.ext_box.bind("<<ComboboxSelected>>", lambda e: self.refresh_view())
         ttk.Label(frow, text="搜索:").pack(side="left")
         self.search_var = tk.StringVar()
         search_e = ttk.Entry(frow, textvariable=self.search_var, width=24)
         search_e.pack(side="left", padx=(2, 8))
-        ttk.Label(frow, text="（格式如 pdf,epub,zip，留空=全部；两项实时生效）",
+        ttk.Label(frow, text="（扫描后下拉可选频道里出现过的格式；搜索实时生效）",
                   foreground="#888").pack(side="left")
-        ext_e.bind("<KeyRelease>", lambda e: self.refresh_view())
         search_e.bind("<KeyRelease>", lambda e: self.refresh_view())
 
         self.stats_var = tk.StringVar(value="尚未扫描。先点【扫描文件列表】。")
@@ -409,10 +411,11 @@ class App:
 
     # ---------- 列表/筛选 ----------
     def refresh_view(self):
-        exts = [x for x in self.ext_var.get().split(",") if x.strip()]
+        ext = self._ext_map.get(self.ext_var.get())
+        exts = [ext] if ext else None
         search = self.search_var.get().strip()
         self.visible = [i for i, e in enumerate(self.entries)
-                        if core.filter_entries([e], exts or None, search or None)]
+                        if core.filter_entries([e], exts, search or None)]
         self.tv.delete(*self.tv.get_children())
         for i in self.visible:
             e = self.entries[i]
@@ -420,6 +423,22 @@ class App:
                 "✓" if i in self.checked else "", e["ext"], core.human_size(e["size"]),
                 e["date"], e["name"]))
         self._update_stats()
+
+    def _rebuild_ext_box(self):
+        """扫描后按频道里实际出现的格式重建下拉项（带数量，按数量降序）。"""
+        counts = {}
+        for e in self.entries:
+            ext = (e["ext"] or "bin").lower()
+            counts[ext] = counts.get(ext, 0) + 1
+        items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        self._ext_map = {"全部格式": None}
+        vals = ["全部格式"]
+        for ext, c in items:
+            label = f"{ext} ({c})"
+            self._ext_map[label] = ext
+            vals.append(label)
+        self.ext_box.config(values=vals)
+        self.ext_var.set("全部格式")
 
     def on_tree_click(self, event):
         row = self.tv.identify_row(event.y)
@@ -550,6 +569,7 @@ class App:
         elif kind == "scanned":
             self.entries = item[1]
             self.checked = set()
+            self._rebuild_ext_box()
             self.refresh_view()
             self._set_idle()
             self._append_log(f"扫描结束：共 {len(self.entries)} 个文件。可筛选后下载。")
