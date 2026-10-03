@@ -57,17 +57,34 @@ async def run(args, api_id, api_hash, phone):
     print(f"已登录：{core.display_name(me)}")
     await client.disconnect()
 
+    if args.list_only:
+        entries = await core.run_scan(
+            api_id, api_hash, args.chat, args.limit,
+            log=print,
+            on_scan=lambda n: print(f"\r已扫描 {n} 条消息…", end="", flush=True),
+            cancelled=lambda: False,
+        )
+        matched = core.filter_entries(entries, args.ext.split(","), args.search)
+        matched.sort(key=lambda e: e["name"].lower())
+        for e in matched:
+            print(f"{e['ext']:8} {core.human_size(e['size']):>10}  {e['date']}  {e['name']}")
+        print(f"\n共 {len(matched)} 个文件，{core.human_size(sum(e['size'] for e in matched))}。"
+              f"去掉 --list-only 即可下载筛选结果。")
+        return 0, 0, 0
+
     return await core.run_download(
         api_id, api_hash, args.chat, args.out, args.limit,
         log=print,
         on_scan=lambda n: print(f"\r已扫描 {n} 条消息…", end="", flush=True),
         on_found=lambda n, tb: print(
-            f"\n找到 {n} 个 PDF（{core.human_size(tb)}），{args.workers} 条连接并行下载…"),
+            f"\n待下载 {n} 个文件（{core.human_size(tb)}），{args.workers} 条连接并行下载…"),
         on_progress=lambda df, tf, bd, tb, name: print(
             f"\r[{df}/{tf}] {core.human_size(bd)}/{core.human_size(tb)} {name[:40]}   ",
             end="", flush=True),
         cancelled=lambda: False,
         workers=args.workers,
+        exts=args.ext.split(","),
+        search=args.search or None,
     )
 
 
@@ -81,6 +98,9 @@ def main():
     ap.add_argument("-o", "--out", default=core.DEFAULT_OUT, help="输出目录（默认：下载文件夹）")
     ap.add_argument("-n", "--limit", type=int, default=0, help="最多扫描的消息数，0=全部")
     ap.add_argument("-w", "--workers", type=int, default=4, help="并行下载连接数（1-8，默认 4）")
+    ap.add_argument("--ext", default="pdf", help="只下载指定格式，逗号分隔（如 pdf,epub,zip）；all=全部类型")
+    ap.add_argument("--search", default="", help="只下载文件名包含该关键字的文件")
+    ap.add_argument("--list-only", action="store_true", help="只列出筛选结果，不下载")
     ap.add_argument("--api-id", type=int, help="my.telegram.org 的 api_id（也可写入 config.json）")
     ap.add_argument("--api-hash", help="my.telegram.org 的 api_hash")
     ap.add_argument("--phone", help="手机号（国际格式，如 +8613800138000）")

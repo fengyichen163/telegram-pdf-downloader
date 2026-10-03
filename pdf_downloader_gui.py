@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Telegram 群/频道 PDF 一键下载器（GUI 版）。
+"""Telegram 群/频道 文件一键下载器（GUI 版）。
 
-- 用自己的 Telegram 账号登录（MTProto），遍历指定群/频道的历史消息，
-  找出所有 PDF 并批量下载到本地。
-- 首次使用需要 api_id / api_hash：到 https://my.telegram.org 免费申请（只需一次）。
-- 会话保存在本目录 session_downloader.session，登录一次后以后直接用。
+- 扫描群/频道全部历史消息，列出所有文件（文档/视频/音频/图片）
+- 按格式筛选（如 pdf,epub,zip）、按文件名搜索、勾选下载
+- 多连接并行下载、.part 断点续传
+- 首次使用需要 api_id / api_hash，或直接用 convert_tdata.py 复用 AyuGram 登录
 """
 import json
 import queue
@@ -80,24 +80,47 @@ class LoginWorker(threading.Thread):
                 log(f"登录成功：{core.display_name(me)}")
                 return "authed"
 
-        return __import__("asyncio").run(run())
+        import asyncio
+        return asyncio.run(run())
 
 
-class DownloadWorker(threading.Thread):
-    def __init__(self, api_id, api_hash, chat, out_dir, limit, workers, q):
+class ScanWorker(threading.Thread):
+    def __init__(self, api_id, api_hash, chat, limit, q):
         super().__init__(daemon=True)
         self.api_id, self.api_hash = api_id, api_hash
-        self.chat, self.out_dir, self.limit = chat, out_dir, limit
-        self.workers, self.q = workers, q
+        self.chat, self.limit, self.q = chat, limit, q
         self.cancel = False
 
     def run(self):
         try:
             import asyncio
-            ok, skip, fail = asyncio.run(core.run_download(
-                self.api_id, self.api_hash, self.chat, self.out_dir, self.limit,
+            entries = asyncio.run(core.run_scan(
+                self.api_id, self.api_hash, self.chat, self.limit,
                 log=lambda t: self.q.put(("log", t)),
                 on_scan=lambda n: self.q.put(("scan", n)),
+                cancelled=lambda: self.cancel,
+            ))
+            self.q.put(("scanned", entries))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("error", f"扫描出错：{e}{core.connection_hint(e)}"))
+
+
+class DownloadWorker(threading.Thread):
+    def __init__(self, api_id, api_hash, chat, entries, out_dir, workers, q):
+        super().__init__(daemon=True)
+        self.api_id, self.api_hash = api_id, api_hash
+        self.chat, self.entries = chat, entries
+        self.out_dir, self.workers, self.q = out_dir, workers, q
+        self.cancel = False
+
+    def run(self):
+        try:
+            import asyncio
+            ok, skip, fail = asyncio.run(core.download_entries(
+                self.api_id, self.api_hash, self.entries, self.out_dir,
+                chat_input=self.chat,
+                log=lambda t: self.q.put(("log", t)),
                 on_found=lambda n, tb: self.q.put(("found", n, tb)),
                 on_progress=lambda df, tf, bd, tb, name: self.q.put(
                     ("dl", df, tf, bd, tb, name)),
@@ -113,57 +136,52 @@ class DownloadWorker(threading.Thread):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Telegram PDF 一键下载器（群/频道批量下载）")
-        root.geometry("800x700")
-        root.minsize(700, 580)
+        root.title("Telegram 文件下载器（群/频道 · 全类型 · 可筛选勾选）")
+        root.geometry("960x780")
+        root.minsize(820, 640)
 
         self.q = queue.Queue()
         self.bridge = Bridge()
         self.worker = None
-        self.mode = None  # None / "login" / "download"
+        self.mode = None  # None / "login" / "scan" / "download"
         self.authed = False
+        self.entries = []       # 扫描出的全部文件条目
+        self.visible = []       # 当前筛选条件下显示的条目下标
+        self.checked = set()    # 勾选的条目下标
 
-        main = ttk.Frame(root, padding=10)
+        main = ttk.Frame(root, padding=8)
         main.pack(fill="both", expand=True)
 
         # ---------- ① 登录区 ----------
-        lf = ttk.LabelFrame(main, text="① 登录（首次使用需配置，之后自动记住）", padding=8)
+        lf = ttk.LabelFrame(main, text="① 登录（首次使用需配置，之后自动记住）", padding=6)
         lf.pack(fill="x")
         lf.columnconfigure(1, weight=1)
 
         ttk.Label(lf, text="API ID:").grid(row=0, column=0, sticky="e")
         self.api_id_var = tk.StringVar()
         ttk.Entry(lf, textvariable=self.api_id_var, width=12).grid(row=0, column=1, sticky="w")
-
         ttk.Label(lf, text="API HASH:").grid(row=1, column=0, sticky="e")
         self.api_hash_var = tk.StringVar()
         ttk.Entry(lf, textvariable=self.api_hash_var).grid(row=1, column=1, columnspan=2, sticky="we")
-
         ttk.Label(lf, text="手机号:").grid(row=2, column=0, sticky="e")
         self.phone_var = tk.StringVar()
         ttk.Entry(lf, textvariable=self.phone_var, width=18).grid(row=2, column=1, sticky="w")
-        ttk.Label(lf, text="（国际格式，如 +8613800138000）", foreground="#888").grid(row=2, column=2, sticky="w")
-
+        ttk.Label(lf, text="（国际格式，如 +8613800138000；用 convert_tdata 转换过则不用管）",
+                  foreground="#888").grid(row=2, column=2, sticky="w")
         ttk.Label(lf, text="代理:").grid(row=3, column=0, sticky="e")
         self.proxy_var = tk.StringVar()
         ttk.Entry(lf, textvariable=self.proxy_var, width=18).grid(row=3, column=1, sticky="w")
         ttk.Label(lf, text="（host:port，如 127.0.0.1:7897；留空=直连）", foreground="#888").grid(row=3, column=2, sticky="w")
 
-        ttk.Label(lf, foreground="#666", wraplength=740, justify="left", text=(
-            "首次使用：浏览器打开 https://my.telegram.org → 用手机号登录 → API development tools "
-            "→ 随便填个应用标题创建 → 把 api_id 和 api_hash 复制到上面（只需一次，会自动保存）。"
-            "若已用 convert_tdata.py 转换过 AyuGram 登录，此处无需改动。"
-        )).grid(row=4, column=0, columnspan=3, sticky="we", pady=(4, 0))
-
         lrow = ttk.Frame(lf)
-        lrow.grid(row=5, column=0, columnspan=3, sticky="we", pady=6)
+        lrow.grid(row=4, column=0, columnspan=3, sticky="we", pady=4)
         self.login_btn = ttk.Button(lrow, text="保存并登录", command=self.on_login)
         self.login_btn.pack(side="left")
         self.auth_status = ttk.Label(lrow, text="未检查", foreground="#888")
         self.auth_status.pack(side="left", padx=8)
 
         vrow = ttk.Frame(lf)
-        vrow.grid(row=6, column=0, columnspan=3, sticky="we")
+        vrow.grid(row=5, column=0, columnspan=3, sticky="we")
         ttk.Label(vrow, text="验证码:").pack(side="left")
         self.code_var = tk.StringVar()
         self.code_entry = ttk.Entry(vrow, textvariable=self.code_var, width=10)
@@ -175,58 +193,104 @@ class App:
         self.pw_entry.pack(side="left", padx=4)
         ttk.Button(vrow, text="提交密码", command=self.on_submit_password).pack(side="left")
 
-        # ---------- ② 下载区 ----------
-        df = ttk.LabelFrame(main, text="② 下载 PDF", padding=8)
-        df.pack(fill="x", pady=8)
-        df.columnconfigure(1, weight=1)
+        # ---------- ② 扫描 ----------
+        sf = ttk.LabelFrame(main, text="② 扫描群/频道文件（文档/视频/音频/图片）", padding=6)
+        sf.pack(fill="x", pady=(6, 0))
+        sf.columnconfigure(1, weight=1)
 
-        ttk.Label(df, text="群/频道:").grid(row=0, column=0, sticky="e")
+        ttk.Label(sf, text="群/频道:").grid(row=0, column=0, sticky="e")
         self.chat_var = tk.StringVar()
-        self.chat_entry = ttk.Entry(df, textvariable=self.chat_var)
+        self.chat_entry = ttk.Entry(sf, textvariable=self.chat_var)
         self.chat_entry.grid(row=0, column=1, sticky="we")
-        ttk.Label(df, text="@用户名 / t.me/链接 / 数字ID", foreground="#888").grid(row=0, column=2, sticky="w")
+        ttk.Label(sf, text="@用户名 / t.me/链接 / 数字ID", foreground="#888").grid(row=0, column=2, sticky="w")
 
-        ttk.Label(df, text="保存到:").grid(row=1, column=0, sticky="e")
+        ttk.Label(sf, text="保存到:").grid(row=1, column=0, sticky="e")
         self.out_var = tk.StringVar(value=core.DEFAULT_OUT)
-        ttk.Entry(df, textvariable=self.out_var).grid(row=1, column=1, sticky="we")
-        ttk.Button(df, text="浏览…", command=self.on_browse).grid(row=1, column=2, sticky="w", padx=(4, 0))
+        ttk.Entry(sf, textvariable=self.out_var).grid(row=1, column=1, sticky="we")
+        ttk.Button(sf, text="浏览…", command=self.on_browse).grid(row=1, column=2, sticky="w", padx=(4, 0))
 
-        ttk.Label(df, text="扫描条数:").grid(row=2, column=0, sticky="e")
+        ttk.Label(sf, text="扫描条数:").grid(row=2, column=0, sticky="e")
+        slim = ttk.Frame(sf)
+        slim.grid(row=2, column=1, sticky="w")
         self.limit_var = tk.IntVar(value=0)
-        ttk.Spinbox(df, from_=0, to=10 ** 9, textvariable=self.limit_var, width=10).grid(row=2, column=1, sticky="w")
-        ttk.Label(df, text="0 = 扫描全部历史消息", foreground="#888").grid(row=2, column=2, sticky="w")
-
-        ttk.Label(df, text="并行连接:").grid(row=3, column=0, sticky="e")
+        ttk.Spinbox(slim, from_=0, to=10 ** 9, textvariable=self.limit_var, width=9).pack(side="left")
+        ttk.Label(slim, text="  0=全部    并行连接:", foreground="#888").pack(side="left")
         self.workers_var = tk.IntVar(value=4)
-        ttk.Spinbox(df, from_=1, to=8, textvariable=self.workers_var, width=10).grid(row=3, column=1, sticky="w")
-        ttk.Label(df, text="条数越多越快，但太大容易触发限流", foreground="#888").grid(row=3, column=2, sticky="w")
+        ttk.Spinbox(slim, from_=1, to=8, textvariable=self.workers_var, width=4).pack(side="left")
+        ttk.Label(slim, text="（1~8）", foreground="#888").pack(side="left")
+
+        srow = ttk.Frame(sf)
+        srow.grid(row=3, column=0, columnspan=3, sticky="we", pady=(5, 0))
+        self.scan_btn = ttk.Button(srow, text="扫描文件列表", command=self.on_scan, state="disabled")
+        self.scan_btn.pack(side="left")
+
+        # ---------- ③ 筛选 + 列表 + 下载 ----------
+        df = ttk.LabelFrame(main, text="③ 筛选 / 勾选 / 下载", padding=6)
+        df.pack(fill="both", expand=True, pady=(6, 0))
+        df.columnconfigure(0, weight=1)
+        df.rowconfigure(2, weight=1)
+
+        frow = ttk.Frame(df)
+        frow.grid(row=0, column=0, sticky="we")
+        ttk.Label(frow, text="格式:").pack(side="left")
+        self.ext_var = tk.StringVar()
+        ext_e = ttk.Entry(frow, textvariable=self.ext_var, width=16)
+        ext_e.pack(side="left", padx=(2, 8))
+        ttk.Label(frow, text="搜索:").pack(side="left")
+        self.search_var = tk.StringVar()
+        search_e = ttk.Entry(frow, textvariable=self.search_var, width=24)
+        search_e.pack(side="left", padx=(2, 8))
+        ttk.Label(frow, text="（格式如 pdf,epub,zip，留空=全部；两项实时生效）",
+                  foreground="#888").pack(side="left")
+        ext_e.bind("<KeyRelease>", lambda e: self.refresh_view())
+        search_e.bind("<KeyRelease>", lambda e: self.refresh_view())
+
+        self.stats_var = tk.StringVar(value="尚未扫描。先点【扫描文件列表】。")
+        ttk.Label(df, textvariable=self.stats_var, foreground="#333").grid(row=1, column=0, sticky="w")
+
+        cols = ("sel", "ext", "size", "date", "name")
+        self.tv = ttk.Treeview(df, columns=cols, show="headings", height=11)
+        for cid, text, w in (("sel", "选", 36), ("ext", "格式", 60),
+                             ("size", "大小", 90), ("date", "日期", 90), ("name", "文件名", 520)):
+            self.tv.heading(cid, text=text)
+            self.tv.column(cid, width=w, minwidth=40,
+                           stretch=(cid == "name"))
+        ys = ttk.Scrollbar(df, command=self.tv.yview)
+        self.tv.configure(yscrollcommand=ys.set)
+        self.tv.grid(row=2, column=0, sticky="nsew")
+        ys.grid(row=2, column=1, sticky="ns")
+        self.tv.bind("<Button-1>", self.on_tree_click)
 
         brow = ttk.Frame(df)
-        brow.grid(row=4, column=0, columnspan=3, sticky="we", pady=(6, 0))
-        self.start_btn = ttk.Button(brow, text="开始下载 PDF", command=self.on_start, state="disabled")
-        self.start_btn.pack(side="left")
+        brow.grid(row=3, column=0, columnspan=2, sticky="we", pady=(5, 0))
+        ttk.Button(brow, text="全选(筛选结果)", command=lambda: self.select_visible("all")).pack(side="left")
+        ttk.Button(brow, text="反选(筛选结果)", command=lambda: self.select_visible("invert")).pack(side="left", padx=4)
+        ttk.Button(brow, text="清除勾选", command=lambda: self.select_visible("none")).pack(side="left")
+        self.dl_sel_btn = ttk.Button(brow, text="下载勾选的文件", command=self.on_download_checked, state="disabled")
+        self.dl_sel_btn.pack(side="left", padx=(14, 4))
+        self.dl_vis_btn = ttk.Button(brow, text="下载全部筛选结果", command=self.on_download_filtered, state="disabled")
+        self.dl_vis_btn.pack(side="left")
         self.cancel_btn = ttk.Button(brow, text="取消", command=self.on_cancel, state="disabled")
-        self.cancel_btn.pack(side="left", padx=6)
-        ttk.Button(brow, text="打开下载目录", command=self.on_open_dir).pack(side="left")
+        self.cancel_btn.pack(side="right")
 
         self.progress = ttk.Progressbar(df, maximum=100)
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="we", pady=(8, 2))
+        self.progress.grid(row=4, column=0, columnspan=2, sticky="we", pady=(6, 2))
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(df, textvariable=self.status_var, foreground="#333").grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Label(df, textvariable=self.status_var, foreground="#333").grid(row=5, column=0, columnspan=2, sticky="w")
 
         # ---------- 日志 ----------
         lf2 = ttk.LabelFrame(main, text="日志", padding=4)
-        lf2.pack(fill="both", expand=True)
-        self.log_text = tk.Text(lf2, height=12, state="disabled", wrap="word", font=("Consolas", 9))
-        ys = ttk.Scrollbar(lf2, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=ys.set)
+        lf2.pack(fill="both", expand=True, pady=(6, 0))
+        self.log_text = tk.Text(lf2, height=8, state="disabled", wrap="word", font=("Consolas", 9))
+        lys = ttk.Scrollbar(lf2, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=lys.set)
         self.log_text.pack(side="left", fill="both", expand=True)
-        ys.pack(side="right", fill="y")
+        lys.pack(side="right", fill="y")
 
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll)
-        self._append_log("提示：登录一次后，以后双击 download_pdfs.bat → 填群/频道链接 → 点【开始下载 PDF】即可。")
+        self._append_log("提示：扫描 → 用格式/搜索筛选 → 点文件行勾选（或全选）→ 下载勾选的文件。")
         if self.api_id_var.get() and self.api_hash_var.get():
             self._start_login(interactive=False)  # 启动时静默检查已保存的会话
 
@@ -321,17 +385,13 @@ class App:
         self.bridge.password_event.set()
         self._append_log("密码已提交…")
 
-    # ---------- 下载 ----------
-    def on_start(self):
+    # ---------- 扫描 ----------
+    def on_scan(self):
         if self.mode or not self.authed:
             return
         chat = self.chat_var.get().strip()
-        out = self.out_var.get().strip()
         if not chat:
             messagebox.showerror("提示", "请填写群/频道链接，例如 @durov 或 t.me/durov。")
-            return
-        if not out:
-            messagebox.showerror("提示", "请选择保存目录。")
             return
         try:
             api_id = int(self.api_id_var.get().strip())
@@ -341,15 +401,94 @@ class App:
             return
         if not self._save_config():
             return
-        self._set_busy("download")
-        self.worker = DownloadWorker(api_id, self.api_hash_var.get().strip(), chat,
-                                     out, limit, self.workers_var.get(), self.q)
+        self.entries, self.checked, self.visible = [], set(), []
+        self.refresh_view()
+        self._set_busy("scan")
+        self.worker = ScanWorker(api_id, self.api_hash_var.get().strip(), chat, limit, self.q)
         self.worker.start()
 
+    # ---------- 列表/筛选 ----------
+    def refresh_view(self):
+        exts = [x for x in self.ext_var.get().split(",") if x.strip()]
+        search = self.search_var.get().strip()
+        self.visible = [i for i, e in enumerate(self.entries)
+                        if core.filter_entries([e], exts or None, search or None)]
+        self.tv.delete(*self.tv.get_children())
+        for i in self.visible:
+            e = self.entries[i]
+            self.tv.insert("", "end", iid=str(i), values=(
+                "✓" if i in self.checked else "", e["ext"], core.human_size(e["size"]),
+                e["date"], e["name"]))
+        self._update_stats()
+
+    def on_tree_click(self, event):
+        row = self.tv.identify_row(event.y)
+        if not row:
+            return
+        idx = int(row)
+        if idx in self.checked:
+            self.checked.discard(idx)
+        else:
+            self.checked.add(idx)
+        self.tv.set(row, "sel", "✓" if idx in self.checked else "")
+        self._update_stats()
+        return "break"
+
+    def select_visible(self, how):
+        if how == "all":
+            self.checked.update(self.visible)
+        elif how == "invert":
+            self.checked ^= set(self.visible)
+        else:
+            self.checked -= set(self.visible)
+        for i in self.visible:
+            self.tv.set(str(i), "sel", "✓" if i in self.checked else "")
+        self._update_stats()
+
+    def _update_stats(self):
+        if not self.entries:
+            return
+        vis = [self.entries[i] for i in self.visible]
+        chk = [self.entries[i] for i in self.checked if i in set(self.visible)]
+        vb = sum(e["size"] for e in vis)
+        cb = sum(e["size"] for e in chk)
+        self.stats_var.set(
+            f"筛选结果: {len(vis)} 个 / {core.human_size(vb)}    "
+            f"已勾选(筛选内): {len(chk)} 个 / {core.human_size(cb)}    "
+            f"总计: {len(self.entries)} 个 / {core.human_size(sum(e['size'] for e in self.entries))}")
+
+    # ---------- 下载 ----------
+    def _start_download(self, entries):
+        if self.mode or not entries:
+            messagebox.showinfo("提示", "没有可下载的文件（先扫描，再筛选/勾选）。")
+            return
+        out = self.out_var.get().strip()
+        if not out:
+            messagebox.showerror("提示", "请选择保存目录。")
+            return
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except ValueError:
+            messagebox.showerror("提示", "API ID 必须是数字。")
+            return
+        if not self._save_config():
+            return
+        self._set_busy("download")
+        self.worker = DownloadWorker(api_id, self.api_hash_var.get().strip(),
+                                     self.chat_var.get().strip(), entries, out,
+                                     self.workers_var.get(), self.q)
+        self.worker.start()
+
+    def on_download_checked(self):
+        self._start_download([self.entries[i] for i in sorted(self.checked)])
+
+    def on_download_filtered(self):
+        self._start_download([self.entries[i] for i in self.visible])
+
     def on_cancel(self):
-        if self.mode == "download" and isinstance(self.worker, DownloadWorker):
+        if self.worker is not None:
             self.worker.cancel = True
-            self._append_log("正在取消…（当前文件下载完或扫描到当前位置后停止）")
+            self._append_log("正在取消…（当前文件处理完后停止）")
 
     def on_browse(self):
         d = filedialog.askdirectory(initialdir=self.out_var.get() or core.DEFAULT_OUT)
@@ -365,19 +504,27 @@ class App:
     # ---------- 状态 ----------
     def _set_busy(self, mode):
         self.mode = mode
-        self.login_btn.config(state="disabled")
-        self.start_btn.config(state="disabled")
-        self.cancel_btn.config(state="enabled" if mode == "download" else "disabled")
+        self.cancel_btn.config(state="enabled" if mode in ("scan", "download") else "disabled")
+        self.login_btn.config(state="enabled" if mode is None else "disabled")
+        self.scan_btn.config(state="enabled" if (mode is None and self.authed) else "disabled")
+        for b in (self.dl_sel_btn, self.dl_vis_btn):
+            b.config(state="enabled" if (mode is None and self.entries) else "disabled")
         if mode == "login":
             self.status_var.set("正在登录/检查会话…")
+        elif mode == "scan":
+            self.status_var.set("扫描中…（消息多时需要几分钟）")
+            self.progress.config(value=0)
         else:
-            self.status_var.set("准备中…")
+            self.status_var.set("准备下载…")
+            self.progress.config(value=0)
 
     def _set_idle(self):
         self.mode = None
         self.cancel_btn.config(state="disabled")
         self.login_btn.config(state="enabled")
-        self.start_btn.config(state="enabled" if self.authed else "disabled")
+        self.scan_btn.config(state="enabled" if self.authed else "disabled")
+        for b in (self.dl_sel_btn, self.dl_vis_btn):
+            b.config(state="enabled" if (self.authed and self.entries) else "disabled")
 
     def _append_log(self, text):
         core.log_file(text)
@@ -400,10 +547,16 @@ class App:
             self._append_log(item[1])
         elif kind == "scan":
             self.status_var.set(f"已扫描 {item[1]} 条消息…")
+        elif kind == "scanned":
+            self.entries = item[1]
+            self.checked = set()
+            self.refresh_view()
+            self._set_idle()
+            self._append_log(f"扫描结束：共 {len(self.entries)} 个文件。可筛选后下载。")
         elif kind == "found":
             n, total_bytes = item[1], item[2]
             self.progress.config(value=0)
-            self.status_var.set(f"找到 {n} 个 PDF（{core.human_size(total_bytes)}），开始并行下载…")
+            self.status_var.set(f"待下载 {n} 个文件（{core.human_size(total_bytes)}），并行下载中…")
         elif kind == "dl":
             df, tf, bd, tb, name = item[1:]
             pct = bd / tb * 100 if tb else 100
@@ -412,7 +565,7 @@ class App:
                 f"[{df}/{tf}] {core.human_size(bd)} / {core.human_size(tb)} · {name}")
         elif kind == "done":
             ok, skip, fail = item[1:]
-            self._append_log(f"全部完成：成功 {ok}，跳过 {skip}，失败 {fail}")
+            self._append_log(f"下载结束：成功 {ok}，跳过 {skip}，失败 {fail}")
             self.status_var.set(f"完成：成功 {ok}，跳过 {skip}，失败 {fail}")
             if ok:
                 self.progress.config(value=100)

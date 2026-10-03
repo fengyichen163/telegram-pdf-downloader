@@ -1,6 +1,7 @@
-# Telegram 群/频道 PDF 一键下载器
+# Telegram 群/频道 文件一键下载器
 
-批量下载指定 Telegram 群组 / 频道里**所有 PDF 文件**的本地工具。
+批量下载指定 Telegram 群组 / 频道里**所有文件**的本地工具：支持全类型扫描、
+格式筛选、文件名搜索、勾选下载，多连接并行 + 断点续传。
 
 > 为什么不是 AyuGram 插件？AyuGram 是 Telegram Desktop 的分支，Telegram 桌面端
 > **没有插件系统**，无法给它装第三方插件。本工具用你自己的账号通过官方 MTProto
@@ -8,11 +9,13 @@
 
 ## 功能
 
-- 📁 扫描群/频道**全部历史消息**，自动识别 PDF（按 MIME 类型 + 文件名后缀）
-- ⬇️ 逐个下载，实时进度条 + 日志，可随时取消
-- 🔁 **断点续传**：已下载过（文件名和大小都相同）的自动跳过，重跑即续传
+- 📁 扫描群/频道**全部历史消息**，列出所有文件（文档/视频/音频/图片，自动跳过贴纸和语音）
+- 🎚️ **格式筛选**（如 `pdf,epub,zip`）与**文件名搜索**实时生效，可组合使用
+- ☑️ 列表中点行勾选，支持全选/反选/清除；可"下载勾选的文件"或"下载全部筛选结果"
+- ⬇️ **多连接并行下载**（1~8 可调），绕开 Telegram 免费账号的单连接限速
+- 🔁 **断点续传**：已存在（文件名和大小都相同）的自动跳过，`.part` 临时文件防半成品
+- 🚦 Telegram 限流自动等待、文件引用过期自动刷新、失败自动重试
 - 🔒 会话保存在本目录，登录一次后以后双击即用
-- 🖥️ 图形界面（GUI）和命令行（CLI）两个版本
 
 ## 登录（两种方式任选）
 
@@ -47,21 +50,25 @@ python convert_tdata.py
   ```
   支持 `socks5` 和 `http`；留空 `"proxy": null` 则直连。
 
-## 日常使用
+## 日常使用（GUI）
 
-1. 双击 `download_pdfs.bat`
-2. 在【群/频道】里填：`@频道用户名`、`t.me/xxxx` 链接或数字 ID
-   - 私有频道：先用 AyuGram 打开过该频道，然后填 `t.me/c/1234567/8` 这类链接或数字 ID（`-100…`）
-3. 选好保存目录 → 点【开始下载 PDF】，等进度条走完即可
+1. 双击 `download_pdfs.bat`，确认显示"已登录 ✔"
+2. 填群/频道 → 点【扫描文件列表】（消息多时需要几分钟）
+3. 用**格式**（如 `pdf,epub,zip`）和**搜索**关键字筛出想要的文件
+4. 点文件行勾选（或"全选(筛选结果)"）→ 点【下载勾选的文件】；
+   或者不勾选直接【下载全部筛选结果】
+5. 进度条按字节统计，可随时取消，重跑自动续传
 
 命令行版（功能相同，方便脚本化）：
 
 ```bat
-python pdf_downloader_cli.py @channel_name
-python pdf_downloader_cli.py t.me/xxxx -o D:\pdfs -n 2000
+python pdf_downloader_cli.py @channel_name                       :: 默认只下 pdf
+python pdf_downloader_cli.py @chan --ext pdf,epub,zip            :: 指定格式
+python pdf_downloader_cli.py @chan --ext all                     :: 全部类型
+python pdf_downloader_cli.py @chan --search 宝典                 :: 文件名含"宝典"
+python pdf_downloader_cli.py @chan --ext all --list-only         :: 只列出筛选结果
+python pdf_downloader_cli.py t.me/xxxx -o D:\files -n 2000 -w 6  :: 限扫描条数/目录/并发
 ```
-
-`-n` 限制最多扫描多少条消息（默认 0 = 全部历史）；`-w` 设置并行下载连接数（默认 4，1~8 可调）。下载使用多条并行连接，绕开 Telegram 免费账号的单连接限速。
 
 ## 常见问题
 
