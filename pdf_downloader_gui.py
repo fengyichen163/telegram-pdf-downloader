@@ -173,15 +173,23 @@ class App:
         ttk.Entry(lf, textvariable=self.proxy_var, width=18).grid(row=3, column=1, sticky="w")
         ttk.Label(lf, text="（host:port，如 127.0.0.1:7897；留空=直连）", foreground="#888").grid(row=3, column=2, sticky="w")
 
+        ttk.Label(lf, foreground="#666", wraplength=880, justify="left", text=(
+            "配置教程（二选一，只需一次）：\n"
+            "① 推荐：AyuGram / Telegram Desktop 已登录的话，在工具目录运行一次 python convert_tdata.py，"
+            "自动复用已登录账号（免申请、免验证码，重启本工具即可用）；\n"
+            "② 手动：浏览器打开 https://my.telegram.org → 用手机号登录 → API development tools → "
+            "随便填个应用标题创建 → 把 api_id 和 api_hash 复制到上面，再点【保存并登录】收验证码。"
+        )).grid(row=4, column=0, columnspan=3, sticky="we", pady=(4, 0))
+
         lrow = ttk.Frame(lf)
-        lrow.grid(row=4, column=0, columnspan=3, sticky="we", pady=4)
+        lrow.grid(row=5, column=0, columnspan=3, sticky="we", pady=4)
         self.login_btn = ttk.Button(lrow, text="保存并登录", command=self.on_login)
         self.login_btn.pack(side="left")
         self.auth_status = ttk.Label(lrow, text="未检查", foreground="#888")
         self.auth_status.pack(side="left", padx=8)
 
         vrow = ttk.Frame(lf)
-        vrow.grid(row=5, column=0, columnspan=3, sticky="we")
+        vrow.grid(row=6, column=0, columnspan=3, sticky="we")
         ttk.Label(vrow, text="验证码:").pack(side="left")
         self.code_var = tk.StringVar()
         self.code_entry = ttk.Entry(vrow, textvariable=self.code_var, width=10)
