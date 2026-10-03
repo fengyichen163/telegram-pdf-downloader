@@ -1,0 +1,20 @@
+# 账号凭证 / 个人配置 —— 绝不能上传
+config.json
+*.session
+*.session-journal
+downloader.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 打包产物
+dist/
+build/
+*.spec
+
+# 系统文件
+.DS_Store
+Thumbs.db
