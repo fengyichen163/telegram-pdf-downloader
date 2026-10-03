@@ -51,7 +51,7 @@ class LoginWorker(threading.Thread):
             q.put(("log", t))
 
         async def run():
-            async with core.make_client(core.SESSION_PATH, self.api_id, self.api_hash) as client:
+            async with core.connected_client(core.SESSION_PATH, self.api_id, self.api_hash) as client:
                 if await client.is_user_authorized():
                     me = await client.get_me()
                     log(f"已登录：{core.display_name(me)}（会话已保存，之后无需重复登录）")

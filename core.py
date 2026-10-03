@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+from contextlib import asynccontextmanager
 
 from telethon import TelegramClient, errors
 
@@ -133,6 +134,22 @@ def make_client(session=SESSION_PATH, api_id=None, api_hash=None):
                           **kwargs)
 
 
+@asynccontextmanager
+async def connected_client(session=SESSION_PATH, api_id=None, api_hash=None):
+    """显式 connect/disconnect 的客户端上下文。
+
+    不能写 `async with TelegramClient(...)`：那会走 Telethon 的 start()，
+    会话未授权时它用内置 input() 讨手机号——pythonw 无控制台直接崩
+    （input(): lost sys.stdin），GUI 自己的验证码流程永远轮不到。
+    """
+    client = make_client(session, api_id, api_hash)
+    try:
+        await client.connect()
+        yield client
+    finally:
+        await client.disconnect()
+
+
 async def login_flow(client, phone, *, log, ask_code, ask_password):
     """交互式登录：请求验证码 → 登录 →（如开启两步验证）输入云密码。"""
     log("正在向 Telegram 请求验证码…")
@@ -234,7 +251,7 @@ async def run_scan(api_id, api_hash, chat_input, limit, *,
                    session_path=SESSION_PATH, log, on_scan, cancelled):
     """扫描目标群/频道的历史消息，返回所有文件条目列表。"""
     chat = parse_chat_input(chat_input)
-    async with make_client(session_path, api_id, api_hash) as client:
+    async with connected_client(session_path, api_id, api_hash) as client:
         if not await client.is_user_authorized():
             raise RuntimeError("尚未登录，请先登录。")
 
@@ -299,7 +316,7 @@ async def download_entries(api_id, api_hash, entries, out_dir, *,
     os.makedirs(out_dir, exist_ok=True)
     workers = max(1, min(int(workers or 1), 8))
 
-    async with make_client(session_path, api_id, api_hash) as client:
+    async with connected_client(session_path, api_id, api_hash) as client:
         if not await client.is_user_authorized():
             raise RuntimeError("尚未登录，请先登录。")
 
@@ -411,7 +428,7 @@ async def download_entries(api_id, api_hash, entries, out_dir, *,
             except OSError as e:
                 log(f"工作连接 {widx + 1} 会话克隆失败：{e}")
                 return
-            async with make_client(wfile, api_id, api_hash) as wclient:
+            async with connected_client(wfile, api_id, api_hash) as wclient:
                 if not await wclient.is_user_authorized():
                     log(f"工作连接 {widx + 1} 授权失败，该连接退出。")
                     return

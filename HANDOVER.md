@@ -105,6 +105,12 @@ need_code/need_password/authed/not_authed`。改回调签名时两端要同步�
    写进 config.json 的 `proxy` 字段（type=socks5，Clash mixed 端口兼容）。Telethon 用
    `proxy={"proxy_type":..., "addr":..., "port":...}` 字典形式
 8. **网络波动**：GitHub 推送偶发 Empty reply/连接失败，重试即可；已把 github.com 固定走代理
+9. **GUI 里禁用 `async with TelegramClient(...)`（2026-10-03 修）**：Telethon 的 `__aenter__`
+   会调 `start()`，会话未授权时它用内置 `input()` 讨手机号——pythonw 无控制台直接崩，
+   报"登录失败：input(): lost sys.stdin"，GUI 自己的 Bridge 验证码流程根本执行不到。
+   一律用 `core.connected_client`（显式 connect/disconnect，不走 start()）。CLI 与
+   convert_tdata.py 一直是显式 connect()，所以只有 GUI 踩到；复现方法：把 SESSION_PATH
+   指到不存在的新会话，在 sys.stdin=None 下跑 LoginWorker。
 
 ## 7. 环境与依赖
 
