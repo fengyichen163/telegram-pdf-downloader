@@ -39,9 +39,11 @@
 | `core.py` | 全部核心逻辑：代理探测/解析、make_client、登录流、run_scan、filter_entries、download_entries、run_download(扫描+筛选+下载的 CLI 便捷封装) |
 | `pdf_downloader_gui.py` | tkinter 界面。线程模型：Tk 主线程 + 后台 threading.Thread（内部 `asyncio.run`）+ `queue.Queue` 消息泵（`_poll` 每 100ms）|
 | `pdf_downloader_cli.py` | 命令行版，参数：`chat, -o, -n, -w, --ext, --search, --list-only, --api-id/--api-hash/--phone` |
-| `convert_tdata.py` | 把 Telegram Desktop/AyuGram 的 tdata 解密并转成 Telethon 会话（**自研解析，见 §6**）|
+| `convert_tdata.py` | 把 Telegram Desktop/AyuGram 的 tdata 解密并转成 Telethon 会话（**自研解析，见 §6**）；`--tdata` 缺省时经 `find_tdata` 自动探测 |
+| `find_tdata.py` | tdata 自动探测（工具旁 ../tdata → 运行中进程 → 开始菜单/桌面快捷方式 .lnk 自研解析 → 注册表卸载项 → APPDATA 默认路径），key_datas 存在性验证，纯标准库 |
 | `inspect_tdata.py` | tdata 结构诊断工具（打印结构、不输出密钥），排障用 |
 | `download_pdfs.bat` | 一键启动 GUI（检测并安装依赖，pythonw 启动）|
+| `login.bat` | 一键本地登录（控制台跑 convert_tdata.py 自动探测转换，自动补装 opentele）|
 | `config.json` | 运行配置（**不入库**）：api_id/api_hash/phone/out_dir/chat/limit/workers/proxy |
 | `session_downloader.session` + `session_downloader_w0..3.session` | 主会话 + 并行工作连接克隆的会话（**不入库，等同账号凭证**）|
 
@@ -133,6 +135,11 @@ telethon==1.45.0  cryptg  opentele==1.15.1 (带 PyQt5)  python-socks[asyncio]
 :: 日常下载（GUI）
 download_pdfs.bat  →  已登录✔  →  填群/频道  →  扫描文件列表
                    →  格式下拉/搜索筛选  →  勾选  →  下载勾选的文件（或下载全部筛选结果）
+
+:: 一键本地登录（免验证码）：双击 login.bat，或 GUI 里点【一键本地登录】
+::   自动探测本机 tdata（进程/快捷方式/注册表/默认路径），找不到时 GUI 给三分支：
+::   手动选 tdata 目录 / 帮装 Telegram 便携版（tg.org zip 走系统代理解压到工具旁 Telegram\）
+::   / 改用验证码登录。控制台手动指定：convert_tdata.py --tdata "AyuGram安装目录\tdata"
 
 :: CLI 示例
 python pdf_downloader_cli.py @chan                     :: 默认只下 pdf

@@ -9,6 +9,8 @@
 import json
 import os
 import queue
+import subprocess
+import sys
 import threading
 import traceback
 import tkinter as tk
@@ -134,6 +136,105 @@ class DownloadWorker(threading.Thread):
             self.q.put(("error", f"下载出错：{e}{core.connection_hint(e)}"))
 
 
+class TdataDetectWorker(threading.Thread):
+    """探测本机已登录的 tdata 目录（find_tdata 级联）。"""
+
+    def __init__(self, q):
+        super().__init__(daemon=True)
+        self.q = q
+
+    def run(self):
+        try:
+            import find_tdata
+            self.q.put(("tdata_found", find_tdata.find_tdata_dirs()))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("error", f"检测 tdata 失败：{e}"))
+
+
+class TdataConvertWorker(threading.Thread):
+    """子进程跑 convert_tdata.py，输出逐行回传 GUI 日志。"""
+
+    def __init__(self, q, tdata=None):
+        super().__init__(daemon=True)
+        self.q, self.tdata = q, tdata
+
+    def run(self):
+        try:
+            # 转换依赖 opentele（含 PyQt5）；下载器首次运行只装了 telethon
+            r = subprocess.run([sys.executable, "-c", "import opentele"],
+                               capture_output=True, creationflags=0x08000000)
+            if r.returncode != 0:
+                self.q.put(("log", "首次使用：正在安装转换依赖 opentele（含 PyQt5，约几十 MB）…"))
+                subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "opentele"],
+                               check=True, creationflags=0x08000000)
+            env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            cmd = [sys.executable, "convert_tdata.py"]
+            if self.tdata:
+                cmd += ["--tdata", self.tdata]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace",
+                                    env=env, cwd=core.APP_DIR, creationflags=0x08000000)
+            for line in proc.stdout:
+                self.q.put(("log", line.rstrip()))
+            self.q.put(("tdata_convert_done", proc.wait() == 0))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("tdata_convert_done", False))
+            self.q.put(("error", f"tdata 转换失败：{e}"))
+
+
+TG_PORTABLE_URL = "https://telegram.org/dl/desktop/win64"
+
+
+class TdataDownloadWorker(threading.Thread):
+    """下载 Telegram 官方便携版 zip（走系统代理），解压并启动，让用户先登录一次。"""
+
+    def __init__(self, q):
+        super().__init__(daemon=True)
+        self.q = q
+
+    def run(self):
+        try:
+            import io
+            import urllib.request
+            import zipfile
+            handlers = []
+            p = core.detect_proxy()
+            if p:
+                # Clash mixed 端口同时接受 http 代理协议，无需 socks 支持
+                proxy = f"http://{p['host']}:{p['port']}"
+                handlers.append(urllib.request.ProxyHandler(
+                    {"http": proxy, "https": proxy}))
+            opener = urllib.request.build_opener(*handlers)
+            self.q.put(("log", "正在下载 Telegram 官方便携版（约 60 MB）…"))
+            resp = opener.open(TG_PORTABLE_URL, timeout=60)
+            total = int(resp.headers.get("Content-Length") or 0)
+            buf, last = bytearray(), 0
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                buf += chunk
+                if total and len(buf) - last >= 4 * 1024 * 1024:
+                    last = len(buf)
+                    self.q.put(("log", f"已下载 {core.human_size(len(buf))}"
+                                       f" / {core.human_size(total)}"))
+            dest = os.path.join(core.APP_DIR, "Telegram")
+            with zipfile.ZipFile(io.BytesIO(bytes(buf))) as z:
+                z.extractall(dest)
+            exe = next((os.path.join(cur, fn)
+                        for cur, _s, fs in os.walk(dest)
+                        for fn in fs if fn.lower() == "telegram.exe"), None)
+            if not exe:
+                raise RuntimeError("解压后没找到 Telegram.exe")
+            os.startfile(exe)
+            self.q.put(("tdata_dl_done", True, exe))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("tdata_dl_done", False, str(e)))
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -175,11 +276,10 @@ class App:
         ttk.Label(lf, text="（host:port，如 127.0.0.1:7897；留空=直连）", foreground="#888").grid(row=3, column=2, sticky="w")
 
         ttk.Label(lf, foreground="#666", wraplength=880, justify="left", text=(
-            "配置教程（二选一，只需一次）：\n"
-            "① 推荐：AyuGram / Telegram Desktop 已登录的话，运行一次 python convert_tdata.py，"
-            "自动复用已登录账号（免申请、免验证码，重启本工具即可用）。\n"
-            "    工具和 AyuGram 不在同一目录下时需指定路径："
-            "python convert_tdata.py --tdata \"AyuGram安装目录\\tdata\"\n"
+            "配置教程（三选一，只需一次）：\n"
+            "① 推荐：点【一键本地登录】，自动找到本机已登录的 Telegram 桌面版 / AyuGram 的 tdata，"
+            "免申请、免验证码。也可在命令行运行 python convert_tdata.py（自动探测 tdata，"
+            "找不到时用 --tdata \"路径\" 指定，或用 login.bat 一键完成）。\n"
             "② 手动：浏览器打开 https://my.telegram.org → 用手机号登录 → API development tools → "
             "随便填个应用标题创建 → 把 api_id 和 api_hash 复制到上面，再点【保存并登录】收验证码。"
         )).grid(row=4, column=0, columnspan=3, sticky="we", pady=(4, 0))
@@ -188,6 +288,8 @@ class App:
         lrow.grid(row=5, column=0, columnspan=3, sticky="we", pady=4)
         self.login_btn = ttk.Button(lrow, text="保存并登录", command=self.on_login)
         self.login_btn.pack(side="left")
+        self.tdata_btn = ttk.Button(lrow, text="一键本地登录", command=self.on_tdata_login)
+        self.tdata_btn.pack(side="left", padx=(8, 0))
         self.auth_status = ttk.Label(lrow, text="未检查", foreground="#888")
         self.auth_status.pack(side="left", padx=8)
 
@@ -372,19 +474,123 @@ class App:
     def on_login(self):
         self._start_login(interactive=True)
 
+    def on_tdata_login(self):
+        """一键本地登录：探测 tdata → 转换，找不到时给三分支选择。"""
+        if self.mode:
+            return
+        self._set_busy("login")
+        self._append_log("正在探测本机已登录的 tdata（进程/快捷方式/注册表）…")
+        TdataDetectWorker(self.q).start()
+
+    def _handle_tdata_found(self, dirs):
+        self._set_idle()
+        if dirs:
+            self._append_log("检测到 " + "；".join(dirs))
+            if len(dirs) == 1:
+                self._run_tdata_convert(dirs[0])
+            else:
+                pick = self._ask_choose(dirs)
+                if pick:
+                    self._run_tdata_convert(pick)
+            return
+        act = self._ask_tdata_action()
+        if act == "manual":
+            d = filedialog.askdirectory(
+                title="选择 Telegram 桌面版 / AyuGram 的 tdata 目录",
+                initialdir=self.out_var.get() or core.DEFAULT_OUT)
+            if d:
+                import find_tdata
+                if find_tdata.is_valid_tdata(d):
+                    self._run_tdata_convert(d)
+                else:
+                    messagebox.showerror(
+                        "提示", "该目录里没有 key_datas，不像已登录的 tdata。\n"
+                        "请确认选择的是 tdata 目录本身（里面应有 key_datas、D877… 等文件）。")
+        elif act == "install":
+            self._set_busy("login")
+            self._append_log("下载并安装 Telegram 官方便携版（便携版 tdata 就在程序目录里）…")
+            TdataDownloadWorker(self.q).start()
+        elif act == "code":
+            self._append_log("请按上方教程②填好 API ID / API HASH / 手机号，点【保存并登录】收验证码。")
+
+    def _run_tdata_convert(self, tdata):
+        self._set_busy("login")
+        self._append_log(f"开始从 tdata 转换登录（{tdata}）…")
+        TdataConvertWorker(self.q, tdata).start()
+
+    def _ask_tdata_action(self):
+        """没找到 tdata 时的三分支选择，返回 'manual'/'install'/'code' 或 None。"""
+        win = tk.Toplevel(self.root)
+        win.title("一键本地登录")
+        win.transient(self.root)
+        win.resizable(False, False)
+        ttk.Label(win, padding=12, wraplength=420, justify="left", text=(
+            "没有在本机检测到已登录的 tdata。\n"
+            "（要求 Telegram 桌面版 / AyuGram 已安装且登录过一次）")).pack()
+        result = []
+
+        def done(v):
+            result.append(v)
+            win.destroy()
+
+        row = ttk.Frame(win, padding=(12, 0, 12, 12))
+        row.pack()
+        ttk.Button(row, text="手动选择\ntdata 目录", width=14,
+                   command=lambda: done("manual")).pack(side="left", padx=4)
+        ttk.Button(row, text="帮我装 Telegram\n便携版", width=14,
+                   command=lambda: done("install")).pack(side="left", padx=4)
+        ttk.Button(row, text="改用验证码登录\n（填 api 参数）", width=14,
+                   command=lambda: done("code")).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.grab_set()
+        self.root.wait_window(win)
+        return result[0] if result else None
+
+    def _ask_choose(self, dirs):
+        """多个候选 tdata 时让用户选一个。"""
+        win = tk.Toplevel(self.root)
+        win.title("选择 tdata")
+        win.transient(self.root)
+        ttk.Label(win, text="检测到多个已登录的 tdata，请选择：", padding=10).pack(anchor="w")
+        var = tk.StringVar(value=dirs[0])
+        box = ttk.Frame(win)
+        box.pack(fill="x", padx=16)
+        for d in dirs:
+            ttk.Radiobutton(box, text=d, value=d, variable=var).pack(anchor="w", pady=2)
+        pick = []
+
+        def ok():
+            pick.append(var.get())
+            win.destroy()
+
+        ttk.Button(win, text="确定", command=ok).pack(pady=10)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.grab_set()
+        self.root.wait_window(win)
+        return pick[0] if pick else None
+
     def _start_login(self, interactive):
         if self.mode:
             return
-        try:
-            api_id = int(self.api_id_var.get().strip())
-        except ValueError:
-            messagebox.showerror("提示", "API ID 必须是数字（在 my.telegram.org 获取）。")
-            return
-        api_hash = self.api_hash_var.get().strip()
+        api_id_text = self.api_id_var.get().strip()
+        api_hash = self.api_hash_var.get().strip() or None
         phone = self.phone_var.get().strip()
-        if not api_hash or not phone:
-            messagebox.showerror("提示", "请填写 API HASH 和手机号。")
-            return
+        if interactive:
+            try:
+                api_id = int(api_id_text)
+            except ValueError:
+                messagebox.showerror("提示", "API ID 必须是数字（在 my.telegram.org 获取）。")
+                return
+            if not api_hash or not phone:
+                messagebox.showerror("提示", "请填写 API HASH 和手机号。")
+                return
+        else:
+            # 静默检查（启动/转换后）：tdata 转换的会话没有手机号也有效；
+            # api 参数留空时由 make_client 回退读 config.json
+            try:
+                api_id = int(api_id_text) if api_id_text else None
+            except ValueError:
+                api_id = None
         if not self._save_config():
             return
         self._set_busy("login")
@@ -539,6 +745,7 @@ class App:
         self.mode = mode
         self.cancel_btn.config(state="enabled" if mode in ("scan", "download") else "disabled")
         self.login_btn.config(state="enabled" if mode is None else "disabled")
+        self.tdata_btn.config(state="enabled" if mode is None else "disabled")
         self.scan_btn.config(state="enabled" if (mode is None and self.authed) else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (mode is None and self.entries) else "disabled")
@@ -555,6 +762,7 @@ class App:
         self.mode = None
         self.cancel_btn.config(state="disabled")
         self.login_btn.config(state="enabled")
+        self.tdata_btn.config(state="enabled")
         self.scan_btn.config(state="enabled" if self.authed else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (self.authed and self.entries) else "disabled")
@@ -608,6 +816,29 @@ class App:
             self._append_log(item[1])
             messagebox.showerror("出错了", item[1])
             self._set_idle()
+        elif kind == "tdata_found":
+            self._handle_tdata_found(item[1])
+        elif kind == "tdata_convert_done":
+            ok = item[1]
+            self._set_idle()
+            if ok:
+                self._append_log("tdata 转换完成，正在检查登录状态…")
+                self._load_config()
+                self._start_login(interactive=False)
+            else:
+                messagebox.showerror("出错了", "tdata 转换失败，详见日志。")
+        elif kind == "tdata_dl_done":
+            ok, msg = item[1], item[2]
+            self._set_idle()
+            if ok:
+                messagebox.showinfo(
+                    "提示", "Telegram 便携版已下载并启动。\n"
+                    "请先在弹出的 Telegram 里登录你的账号，\n"
+                    "然后回到本工具再点一次【一键本地登录】即可。")
+            else:
+                messagebox.showerror(
+                    "出错了", f"下载失败：{msg}\n"
+                    "可手动从 telegram.org 下载便携版解压后，用【手动选择 tdata 目录】重试。")
         elif kind == "need_code":
             self._append_log("请输入验证码，然后点【提交验证码】。")
             self.code_entry.focus_set()

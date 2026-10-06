@@ -154,12 +154,26 @@ async def main():
                     help="账号索引（0=主账号），默认用 AyuGram 当前活跃账号")
     ap.add_argument("--passcode", default="", help="tdata 本地密码（如设置过）")
     ap.add_argument("--proxy", default="", help="代理地址，如 127.0.0.1:7897")
-    ap.add_argument("--tdata", default=os.path.normpath(
-        os.path.join(core.APP_DIR, "..", "tdata")), help="tdata 目录")
+    ap.add_argument("--tdata", default=None,
+                    help="tdata 目录；默认自动探测（工具旁 ../tdata → 运行中进程 → "
+                         "开始菜单/桌面快捷方式 → 注册表 → 默认路径）")
     args = ap.parse_args()
 
+    if args.tdata:
+        tdata_dir = args.tdata
+    else:
+        import find_tdata
+        cands = find_tdata.find_tdata_dirs()
+        if not cands:
+            raise SystemExit(
+                "未自动找到已登录的 tdata。请先打开并登录 Telegram 桌面版/AyuGram 后重试，"
+                "或用 --tdata 手动指定 tdata 目录。")
+        tdata_dir = cands[0]
+        extra = f"（另有 {len(cands) - 1} 个候选，可用 --tdata 指定）" if len(cands) > 1 else ""
+        print(f"自动检测到 tdata：{tdata_dir}{extra}")
+
     try:
-        accounts, active = read_accounts(args.tdata, args.passcode.encode())
+        accounts, active = read_accounts(tdata_dir, args.passcode.encode())
     except BaseException as e:
         raise SystemExit(
             f"无法解析 tdata（{type(e).__name__}）。"
