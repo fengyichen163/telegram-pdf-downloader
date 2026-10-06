@@ -71,7 +71,11 @@ def _running_exe_paths():
 
 
 def _lnk_targets():
-    """解析开始菜单/桌面里名字含 ayugram/telegram 的 .lnk，返回目标 exe 路径。"""
+    """解析开始菜单/桌面里 ayugram/telegram 相关 .lnk 的目标 exe。
+
+    用 PowerShell 的 WScript.Shell COM 解析（与资源管理器同源）——自研 MS-SHLLINK
+    解析实测会漏（新式 .lnk 的目标只存在 IDList，LinkInfo 里没有）。
+    """
     if sys.platform != "win32":
         return []
     appdata = os.environ.get("APPDATA", "")
@@ -85,42 +89,25 @@ def _lnk_targets():
     onedrive = os.environ.get("OneDrive")
     if onedrive:
         scan_dirs.append(os.path.join(onedrive, "Desktop"))
+    scan_dirs = [d for d in scan_dirs if os.path.isdir(d)]
+    if not scan_dirs:
+        return []
 
-    out = []
-    for base in scan_dirs:
-        if not os.path.isdir(base):
-            continue
-        for cur, _sub, files in os.walk(base):
-            for fn in files:
-                low = fn.lower()
-                if not low.endswith(".lnk"):
-                    continue
-                if not any(k in low for k in _EXE_KEYWORDS):
-                    continue
-                target = _parse_lnk(os.path.join(cur, fn))
-                if (target and target.lower().endswith(".exe")
-                        and os.path.isfile(target)
-                        and any(k in os.path.basename(target).lower() for k in _EXE_KEYWORDS)):
-                    out.append(target)
-    return out
-
-
-def _parse_lnk(path):
-    """从 .lnk（MS-SHLLINK 格式）提取本地目标路径，失败返回 None。"""
+    arr = ",".join("'" + d.replace("'", "''") + "'" for d in scan_dirs)
+    cmd = ("$sh = New-Object -ComObject WScript.Shell; "
+           f"Get-ChildItem -Path {arr} -Filter *.lnk -Recurse -ErrorAction SilentlyContinue | "
+           "ForEach-Object { try { $p = $sh.CreateShortcut($_.FullName).TargetPath; "
+           "if ($p -and ($_.Name -match 'ayugram|telegram' -or $p -match 'ayugram|telegram')) "
+           "{ $p } } catch {} }")
     try:
-        with open(path, "rb") as f:
-            data = f.read(8192)
-        if len(data) < 0x4C or data[:4] != b"L\x00\x00\x00":
-            return None
-        flags = int.from_bytes(data[0x14:0x18], "little")
-        if not flags & 0x1:  # HasLinkInfo
-            return None
-        li = 0x4C  # LinkInfo 紧跟头部
-        lbp = int.from_bytes(data[li + 0x10:li + 0x14], "little")  # LocalBasePathOffset
-        raw = data[li + lbp:]
-        return raw.split(b"\x00", 1)[0].decode("mbcs", "replace") or None
-    except OSError:
-        return None
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                             capture_output=True, text=True, timeout=40,
+                             creationflags=_NO_WINDOW).stdout or ""
+    except Exception:
+        return []
+    return [ln.strip() for ln in out.splitlines()
+            if ln.strip().lower().endswith(".exe") and os.path.isfile(ln.strip())
+            and any(k in ln.strip().lower() for k in _EXE_KEYWORDS)]
 
 
 def _registry_exe_paths():
