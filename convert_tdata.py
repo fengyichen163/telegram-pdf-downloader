@@ -21,7 +21,6 @@ from telethon import TelegramClient
 from telethon.crypto.authkey import AuthKey as TelethonAuthKey
 from telethon.sessions import SQLiteSession
 
-from opentele.api import API
 from opentele.td import auth as au
 from opentele.td import storage as st
 
@@ -36,6 +35,12 @@ DC_IPS = {
     5: "91.108.56.130",
 }
 K_WIDE_IDS_TAG = ~0 & 0xFFFFFFFFFFFFFFFF  # Account.kWideIdsTag
+
+# 官方 Telegram Desktop 的公开 API 参数（AyuGram 同款）。
+# 不要用 opentele 的 TelegramDesktop 预设（api_id=2040）：
+# 它 home DC 正常、跨 DC 文件下载会挂（见 HANDOVER 踩坑 #3）。
+DESKTOP_API_ID = 17349
+DESKTOP_API_HASH = "344583e45741c457fe1862106095a5eb"
 
 
 def read_accounts(tdata, passcode=b""):
@@ -102,7 +107,7 @@ def range_ok(n):
     return max(0, min(n, 8))
 
 
-async def build_session(api, account, proxy=None):
+async def build_session(account, proxy=None):
     """把授权密钥写进 SQLiteSession 并联网验证。"""
     sess = SQLiteSession(core.SESSION_PATH)
     ip = DC_IPS.get(account["dc_id"], DC_IPS[2])
@@ -114,7 +119,7 @@ async def build_session(api, account, proxy=None):
     if proxy:
         kwargs["proxy"] = {"proxy_type": proxy["type"], "addr": proxy["host"],
                            "port": int(proxy["port"])}
-    client = TelegramClient(sess, api.api_id, api.api_hash, **kwargs)
+    client = TelegramClient(sess, DESKTOP_API_ID, DESKTOP_API_HASH, **kwargs)
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -124,7 +129,7 @@ async def build_session(api, account, proxy=None):
         await client.disconnect()
 
 
-def save_config(api, proxy=None):
+def save_config(proxy=None):
     cfg = {}
     try:
         with open(core.CONFIG_PATH, encoding="utf-8") as f:
@@ -134,8 +139,8 @@ def save_config(api, proxy=None):
     cfg.setdefault("out_dir", core.DEFAULT_OUT)
     cfg.setdefault("chat", "")
     cfg.setdefault("limit", 0)
-    cfg["api_id"] = api.api_id
-    cfg["api_hash"] = api.api_hash
+    cfg["api_id"] = DESKTOP_API_ID
+    cfg["api_hash"] = DESKTOP_API_HASH
     cfg.pop("phone", None)
     if proxy:
         cfg["proxy"] = proxy
@@ -173,8 +178,8 @@ async def main():
     if account is None:
         raise SystemExit(f"账号索引 {idx} 不存在或未登录。")
 
-    api = API.TelegramDesktop.Generate()
-    print(f"正在为 userId={account['user_id']} 生成会话（api_id={api.api_id}）…")
+    print(f"正在为 userId={account['user_id']} 生成会话"
+          f"（api_id={DESKTOP_API_ID}，官方 Telegram Desktop 参数）…")
 
     # 依次尝试：--proxy 参数 > 系统代理 > 直连
     candidates = []
@@ -193,7 +198,7 @@ async def main():
     for proxy in candidates:
         label = f"{proxy['type']} {proxy['host']}:{proxy['port']}" if proxy else "直连"
         try:
-            me = await build_session(api, account, proxy)
+            me = await build_session(account, proxy)
         except BaseException as e:
             last_err = e
             print(f"  经 {label} 连接失败：{type(e).__name__}")
@@ -208,7 +213,7 @@ async def main():
             "若你的网络需要代理，请用 --proxy 127.0.0.1:端口 指定。"
         )
 
-    save_config(api, used_proxy)
+    save_config(used_proxy)
     print(f"登录成功：{core.display_name(me)}（ID {me.id}）")
     print(f"会话已保存：{core.SESSION_PATH}.session")
     print("配置已写入 config.json —— 现在双击 download_pdfs.bat 即可直接下载。")

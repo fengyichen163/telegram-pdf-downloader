@@ -7,6 +7,7 @@
 - 首次使用需要 api_id / api_hash，或直接用 convert_tdata.py 复用 AyuGram 登录
 """
 import json
+import os
 import queue
 import threading
 import traceback
@@ -175,8 +176,10 @@ class App:
 
         ttk.Label(lf, foreground="#666", wraplength=880, justify="left", text=(
             "配置教程（二选一，只需一次）：\n"
-            "① 推荐：AyuGram / Telegram Desktop 已登录的话，在工具目录运行一次 python convert_tdata.py，"
-            "自动复用已登录账号（免申请、免验证码，重启本工具即可用）；\n"
+            "① 推荐：AyuGram / Telegram Desktop 已登录的话，运行一次 python convert_tdata.py，"
+            "自动复用已登录账号（免申请、免验证码，重启本工具即可用）。\n"
+            "    工具和 AyuGram 不在同一目录下时需指定路径："
+            "python convert_tdata.py --tdata \"AyuGram安装目录\\tdata\"\n"
             "② 手动：浏览器打开 https://my.telegram.org → 用手机号登录 → API development tools → "
             "随便填个应用标题创建 → 把 api_id 和 api_hash 复制到上面，再点【保存并登录】收验证码。"
         )).grid(row=4, column=0, columnspan=3, sticky="we", pady=(4, 0))
@@ -301,7 +304,8 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll)
         self._append_log("提示：扫描 → 用格式/搜索筛选 → 点文件行勾选（或全选）→ 下载勾选的文件。")
-        if self.api_id_var.get() and self.api_hash_var.get():
+        if ((self.api_id_var.get() and self.api_hash_var.get())
+                or os.path.exists(core.SESSION_PATH + ".session")):
             self._start_login(interactive=False)  # 启动时静默检查已保存的会话
 
     # ---------- 配置 ----------
@@ -339,9 +343,11 @@ class App:
                 cfg = json.load(f)
         except (OSError, ValueError):
             cfg = {}
-        cfg["api_id"] = self.api_id_var.get().strip()
-        cfg["api_hash"] = self.api_hash_var.get().strip()
-        cfg["phone"] = self.phone_var.get().strip()
+        # api_id/api_hash/phone 空值时保留旧值：tdata 转换写入的 api 参数不在界面上，
+        # 不能被一次空输入框的保存冲掉（否则启动静默检查不跑，显示"未检查"）
+        cfg["api_id"] = self.api_id_var.get().strip() or cfg.get("api_id", "")
+        cfg["api_hash"] = self.api_hash_var.get().strip() or cfg.get("api_hash", "")
+        cfg["phone"] = self.phone_var.get().strip() or cfg.get("phone", "")
         cfg["out_dir"] = self.out_var.get().strip()
         cfg["chat"] = self.chat_var.get().strip()
         cfg["limit"] = self.limit_var.get()

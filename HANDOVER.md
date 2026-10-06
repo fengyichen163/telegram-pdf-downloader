@@ -111,6 +111,12 @@ need_code/need_password/authed/not_authed`。改回调签名时两端要同步�
    一律用 `core.connected_client`（显式 connect/disconnect，不走 start()）。CLI 与
    convert_tdata.py 一直是显式 connect()，所以只有 GUI 踩到；复现方法：把 SESSION_PATH
    指到不存在的新会话，在 sys.stdin=None 下跑 LoginWorker。
+10. **convert_tdata 别用 opentele 的 API 预设，GUI 别回写空 api 字段（2026-10-03 修）**：
+    `API.TelegramDesktop.Generate()` 是 api_id=2040（跨 DC 下载会挂，见 #3），已改为直接用
+    官方 Telegram Desktop 公开参数（17349）并写进 config.json；GUI `_save_config` 对
+    api_id/api_hash/phone 改为"空值保留旧值"——否则 tdata 转换好的配置会被一次空输入框的
+    保存冲掉，启动静默检查（条件是 api 字段非空）不跑，症状是"转换明明成功，GUI 却一直
+    未检查/未登录"。静默检查条件已放宽为：api 字段非空 **或** session 文件存在。
 
 ## 7. 环境与依赖
 
@@ -137,6 +143,7 @@ python pdf_downloader_cli.py @chan -o D:\dir -n 5000 -w 6  :: 目录/扫描上�
 
 :: 补漏：直接重跑即可，已存在文件自动跳过，只补失败件
 :: 重新登录：删 session*.session 后走验证码登录，或重跑 convert_tdata.py
+::   （工具和 AyuGram 不同目录时：convert_tdata.py --tdata "AyuGram安装目录\tdata"）
 :: 提交发布：git add -A && git commit -m "..." && git push   （自动双仓库）
 ```
 
