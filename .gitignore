@@ -18,3 +18,8 @@ build/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 复制功能运行时状态（本地）
+copy_dedup.sqlite3
+copy_progress/
+Telegram/
