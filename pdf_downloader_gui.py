@@ -262,6 +262,65 @@ class CopyWorker(threading.Thread):
             self.q.put(("copy_done", None))
 
 
+class BackupScanWorker(threading.Thread):
+    """备份预扫描：全量消息 + 过滤 + 排序，返回计划供预览（不下载不导出）。"""
+
+    def __init__(self, api_id, api_hash, src, rules, order, limit, q):
+        super().__init__(daemon=True)
+        self.api_id, self.api_hash = api_id, api_hash
+        self.src, self.rules, self.order = src, rules, order
+        self.limit, self.q = limit, q
+
+    def run(self):
+        try:
+            import asyncio
+            import backup_core
+
+            async def run():
+                async with core.connected_client(
+                        core.SESSION_PATH, self.api_id, self.api_hash) as client:
+                    if not await client.is_user_authorized():
+                        raise RuntimeError("尚未登录，请先登录。")
+                    return await backup_core.plan_backup(
+                        client, self.src, self.rules, self.order, self.limit,
+                        log=lambda t: self.q.put(("log", t)),
+                        cancelled=lambda: False)
+
+            entries, stats, _src, title = asyncio.run(run())
+            self.q.put(("backup_planned", entries, stats, title))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("error", f"备份扫描失败：{e}{core.connection_hint(e)}"))
+
+
+class BackupExportWorker(threading.Thread):
+    """本地备份导出：下载媒体 → 渲染 HTML → 按形态打包。"""
+
+    def __init__(self, api_id, api_hash, src, out_dir, mode, opts, q):
+        super().__init__(daemon=True)
+        self.api_id, self.api_hash = api_id, api_hash
+        self.src, self.out_dir, self.mode = src, out_dir, mode
+        self.opts, self.q = opts, q
+        self.cancel = False
+
+    def run(self):
+        try:
+            import asyncio
+            import backup_core
+            stats = asyncio.run(backup_core.export_backup(
+                self.api_id, self.api_hash, self.src, self.out_dir, self.mode,
+                self.opts,
+                log=lambda t: self.q.put(("log", t)),
+                on_progress=lambda pct, tot, txt: self.q.put(
+                    ("backup_progress", pct, txt)),
+                cancelled=lambda: self.cancel))
+            self.q.put(("backup_done", stats))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("error", f"备份导出失败：{e}{core.connection_hint(e)}"))
+            self.q.put(("backup_done", None))
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -285,9 +344,11 @@ class App:
         tab_login = ttk.Frame(self.nb, padding=8)
         tab_dl = ttk.Frame(self.nb, padding=8)
         tab_copy = ttk.Frame(self.nb, padding=8)
+        tab_backup = ttk.Frame(self.nb, padding=8)
         self.nb.add(tab_login, text="① 登录")
         self.nb.add(tab_dl, text="② 扫描 / 下载")
         self.nb.add(tab_copy, text="③ 频道复制")
+        self.nb.add(tab_backup, text="④ 本地备份")
 
         # ---------- ① 登录区 ----------
         lf = ttk.LabelFrame(tab_login, text="登录（首次使用需配置，之后自动记住）", padding=6)
@@ -438,6 +499,7 @@ class App:
         lys.pack(side="right", fill="y")
 
         self._build_copy_tab(tab_copy)
+        self._build_backup_tab(tab_backup)
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll)
@@ -633,6 +695,218 @@ class App:
                                  src, dest, opts, self.q)
         self.worker.start()
 
+    # ---------- ④ 本地备份 ----------
+    def _build_backup_tab(self, tab):
+        tab.columnconfigure(1, weight=1)
+        r = 0
+
+        ttk.Label(tab, text="源群/频道:").grid(row=r, column=0, sticky="e")
+        self.bk_src_var = tk.StringVar()
+        ttk.Entry(tab, textvariable=self.bk_src_var).grid(row=r, column=1, sticky="we")
+        ttk.Label(tab, text="@用户名 / t.me / 数字ID", foreground="#888").grid(
+            row=r, column=2, sticky="w")
+        r += 1
+
+        ttk.Label(tab, text="保存到:").grid(row=r, column=0, sticky="e")
+        orow = ttk.Frame(tab)
+        orow.grid(row=r, column=1, columnspan=2, sticky="we")
+        self.bk_out_var = tk.StringVar()
+        ttk.Entry(orow, textvariable=self.bk_out_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(orow, text="浏览…", command=self.on_bk_browse).pack(side="left", padx=(4, 0))
+        r += 1
+
+        ttk.Label(tab, text="导出形态:").grid(row=r, column=0, sticky="e")
+        mrow = ttk.Frame(tab)
+        mrow.grid(row=r, column=1, columnspan=2, sticky="w")
+        self.bk_mode_var = tk.StringVar(value="散件式（逐个文件+聊天索引）")
+        ttk.Combobox(mrow, textvariable=self.bk_mode_var, width=24, state="readonly",
+                     values=["散件式（逐个文件+聊天索引）", "打包式（单个压缩包）",
+                             "打包式（分卷）"]).pack(side="left")
+        ttk.Label(mrow, text="   分卷大小(GB):").pack(side="left")
+        self.bk_vol_gb_var = tk.DoubleVar(value=3.8)
+        ttk.Spinbox(mrow, from_=0.5, to=100, increment=0.5,
+                    textvariable=self.bk_vol_gb_var, width=5).pack(side="left")
+        ttk.Label(mrow, text="   排序:").pack(side="left")
+        self.bk_order_var = tk.StringVar(value="时间正序")
+        ttk.Combobox(mrow, textvariable=self.bk_order_var, width=10, state="readonly",
+                     values=["时间正序", "时间倒序", "大小正序", "大小倒序"]).pack(side="left")
+        ttk.Label(mrow, text="   上限:").pack(side="left")
+        self.bk_limit_var = tk.IntVar(value=0)
+        ttk.Spinbox(mrow, from_=0, to=10 ** 9, textvariable=self.bk_limit_var,
+                    width=9).pack(side="left")
+        ttk.Label(mrow, text="   并行:").pack(side="left")
+        self.bk_workers_var = tk.IntVar(value=3)
+        ttk.Spinbox(mrow, from_=1, to=8, textvariable=self.bk_workers_var,
+                    width=4).pack(side="left")
+        r += 1
+
+        frow = ttk.Frame(tab)
+        frow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        ttk.Label(frow, text="成员排除:").pack(side="left")
+        self.bk_sender_block_var = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.bk_sender_block_var, width=22).pack(side="left", padx=(2, 10))
+        ttk.Label(frow, text="成员只留:").pack(side="left")
+        self.bk_sender_allow_var = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.bk_sender_allow_var, width=22).pack(side="left", padx=(2, 10))
+        ttk.Label(frow, text="无署名:").pack(side="left")
+        self.bk_anon_var = tk.StringVar(value="全部保留")
+        ttk.Combobox(frow, textvariable=self.bk_anon_var, width=10, state="readonly",
+                     values=["全部保留", "排除无署名", "仅保留有署名"]).pack(side="left")
+        ttk.Label(frow, text="（ID/@用户名/昵称，逗号分隔）", foreground="#888").pack(side="left", padx=(8, 0))
+        r += 1
+
+        krow = ttk.Frame(tab)
+        krow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        ttk.Label(krow, text="关键词排除:").pack(side="left")
+        self.bk_kw_block_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.bk_kw_block_var, width=26).pack(side="left", padx=(2, 10))
+        ttk.Label(krow, text="关键词只留:").pack(side="left")
+        self.bk_kw_allow_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.bk_kw_allow_var, width=26).pack(side="left", padx=(2, 10))
+        ttk.Label(krow, text="时间从:").pack(side="left")
+        self.bk_date_from_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.bk_date_from_var, width=11).pack(side="left", padx=(2, 4))
+        ttk.Label(krow, text="到").pack(side="left")
+        self.bk_date_to_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.bk_date_to_var, width=11).pack(side="left", padx=(4, 0))
+        r += 1
+
+        brow = ttk.Frame(tab)
+        brow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        self.bk_scan_btn = ttk.Button(brow, text="扫描 / 预览", command=self.on_backup_scan)
+        self.bk_scan_btn.pack(side="left")
+        self.bk_export_btn = ttk.Button(brow, text="开始导出", command=self.on_backup_export,
+                                        state="disabled")
+        self.bk_export_btn.pack(side="left", padx=6)
+        self.bk_cancel_btn = ttk.Button(brow, text="取消", command=self.on_cancel,
+                                        state="disabled")
+        self.bk_cancel_btn.pack(side="left")
+        ttk.Label(brow, text="（预览列表最多显示前 1500 条，完整结果以导出为准）",
+                  foreground="#888").pack(side="left", padx=10)
+        r += 1
+
+        self.bk_progressbar = ttk.Progressbar(tab, maximum=100)
+        self.bk_progressbar.grid(row=r, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        r += 1
+
+        cols = ("idx", "date", "sender", "type", "size", "snippet")
+        self.bk_tv = ttk.Treeview(tab, columns=cols, show="headings", height=13)
+        for cid, text, w in (("idx", "序", 50), ("date", "日期", 90),
+                             ("sender", "署名", 130), ("type", "类型", 60),
+                             ("size", "大小", 80), ("snippet", "内容摘要", 500)):
+            self.bk_tv.heading(cid, text=text)
+            self.bk_tv.column(cid, width=w, minwidth=40, stretch=(cid == "snippet"))
+        ys = ttk.Scrollbar(tab, command=self.bk_tv.yview)
+        self.bk_tv.configure(yscrollcommand=ys.set)
+        self.bk_tv.grid(row=r, column=0, columnspan=2, sticky="nsew")
+        ys.grid(row=r, column=2, sticky="ns")
+        tab.rowconfigure(r, weight=1)
+
+    def _bk_rules(self):
+        def split(s):
+            return [x.strip() for x in (s or "").replace("，", ",").split(",") if x.strip()]
+
+        anon_map = {"全部保留": "keep", "排除无署名": "exclude", "仅保留有署名": "only"}
+        return {
+            "sender_block": split(self.bk_sender_block_var.get()),
+            "sender_allow": split(self.bk_sender_allow_var.get()),
+            "anonymous": anon_map.get(self.bk_anon_var.get(), "keep"),
+            "keyword_block": split(self.bk_kw_block_var.get()),
+            "keyword_allow": split(self.bk_kw_allow_var.get()),
+            "media": "all",
+            "exts": [],
+            "date_from": self.bk_date_from_var.get().strip(),
+            "date_to": self.bk_date_to_var.get().strip(),
+        }
+
+    def on_bk_browse(self):
+        d = filedialog.askdirectory(initialdir=self.bk_out_var.get() or core.DEFAULT_OUT)
+        if d:
+            self.bk_out_var.set(d)
+
+    def on_backup_scan(self):
+        if self.mode or not self.authed:
+            return
+        src = self.bk_src_var.get().strip()
+        if not src:
+            messagebox.showerror("提示", "请填写源群/频道。")
+            return
+        if not self._save_config():
+            return
+        self._set_busy("backup")
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except ValueError:
+            api_id = None
+        self.worker = BackupScanWorker(api_id, self.api_hash_var.get().strip() or None,
+                                       src, self._bk_rules(),
+                                       {"时间正序": "time_asc", "时间倒序": "time_desc",
+                                        "大小正序": "size_asc", "大小倒序": "size_desc"}[
+                                            self.bk_order_var.get()],
+                                       self.bk_limit_var.get(), self.q)
+        self.worker.start()
+
+    def _backup_type(self, e):
+        if e.get("text", "").startswith("[投票]"):
+            return "投票"
+        ext = (e.get("ext") or "").lower()
+        if not e.get("has_media"):
+            return "文本"
+        if ext in ("jpg", "jpeg", "png", "webp", "gif"):
+            return "图片"
+        if ext in ("mp4", "mkv", "mov", "webm"):
+            return "视频"
+        if ext in ("mp3", "ogg", "oga", "opus", "wav", "m4a"):
+            return "音频"
+        return "文件"
+
+    def _fill_backup_preview(self, entries):
+        self.bk_tv.delete(*self.bk_tv.get_children())
+        for i, e in enumerate(entries[:1500], 1):
+            snippet = (e.get("text") or e.get("mfile") or "").replace("\n", " ")[:80]
+            self.bk_tv.insert("", "end", values=(
+                f"{i}", e.get("date", ""), e.get("sender_name") or ("匿名" if e.get("anonymous") else ""),
+                self._backup_type(e), core.human_size(e.get("size") or 0) if e.get("has_media") else "", snippet))
+
+    def on_backup_export(self):
+        if self.mode or not self.authed:
+            return
+        src = self.bk_src_var.get().strip()
+        out = self.bk_out_var.get().strip()
+        if not src:
+            messagebox.showerror("提示", "请填写源群/频道。")
+            return
+        if not out:
+            messagebox.showerror("提示", "请选择保存目录。")
+            return
+        for dfld, dtxt in ((self.bk_date_from_var, "时间从"),
+                           (self.bk_date_to_var, "时间到")):
+            v = dfld.get().strip()
+            if v and len(v.split("-")) != 3:
+                messagebox.showerror("提示", f"{dtxt} 日期格式应为 2024-01-01。")
+                return
+        mode = {"散件式（逐个文件+聊天索引）": "files", "打包式（单个压缩包）": "zip",
+                "打包式（分卷）": "volumes"}[self.bk_mode_var.get()]
+        opts = {
+            "rules": self._bk_rules(),
+            "order": {"时间正序": "time_asc", "时间倒序": "time_desc",
+                      "大小正序": "size_asc", "大小倒序": "size_desc"}[
+                          self.bk_order_var.get()],
+            "limit": self.bk_limit_var.get(),
+            "workers": self.bk_workers_var.get(),
+            "vol_gb": self.bk_vol_gb_var.get(),
+        }
+        if not self._save_config():
+            return
+        self._set_busy("backup")
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except ValueError:
+            api_id = None
+        self.worker = BackupExportWorker(api_id, self.api_hash_var.get().strip() or None,
+                                         src, out, mode, opts, self.q)
+        self.worker.start()
+
     # ---------- 配置 ----------
     def _load_config(self):
         try:
@@ -685,6 +959,32 @@ class App:
             except (TypeError, ValueError):
                 self.copy_limit_var.set(0)
             self._copy_dest_mode_changed()
+        b = cfg.get("backup") or {}
+        if b:
+            self.bk_src_var.set(b.get("src", "") or "")
+            self.bk_out_var.set(b.get("out_dir", "") or "")
+            self.bk_mode_var.set(b.get("mode", "散件式（逐个文件+聊天索引）")
+                                 or "散件式（逐个文件+聊天索引）")
+            try:
+                self.bk_vol_gb_var.set(float(b.get("vol_gb", 3.8) or 3.8))
+            except (TypeError, ValueError):
+                self.bk_vol_gb_var.set(3.8)
+            self.bk_order_var.set(b.get("order", "时间正序") or "时间正序")
+            try:
+                self.bk_limit_var.set(int(b.get("limit", 0) or 0))
+            except (TypeError, ValueError):
+                self.bk_limit_var.set(0)
+            try:
+                self.bk_workers_var.set(int(b.get("workers", 3) or 3))
+            except (TypeError, ValueError):
+                self.bk_workers_var.set(3)
+            self.bk_anon_var.set(b.get("anon", "全部保留") or "全部保留")
+            self.bk_sender_block_var.set(b.get("sender_block", "") or "")
+            self.bk_sender_allow_var.set(b.get("sender_allow", "") or "")
+            self.bk_kw_block_var.set(b.get("kw_block", "") or "")
+            self.bk_kw_allow_var.set(b.get("kw_allow", "") or "")
+            self.bk_date_from_var.set(b.get("date_from", "") or "")
+            self.bk_date_to_var.set(b.get("date_to", "") or "")
 
     def _save_config(self):
         # 先读旧配置做合并，避免弄丢 convert_tdata.py 等写入的字段（如 proxy）
@@ -731,6 +1031,22 @@ class App:
             "date_from": self.copy_date_from_var.get().strip(),
             "date_to": self.copy_date_to_var.get().strip(),
             "limit": self.copy_limit_var.get(),
+        }
+        cfg["backup"] = {
+            "src": self.bk_src_var.get().strip(),
+            "out_dir": self.bk_out_var.get().strip(),
+            "mode": self.bk_mode_var.get(),
+            "vol_gb": self.bk_vol_gb_var.get(),
+            "order": self.bk_order_var.get(),
+            "limit": self.bk_limit_var.get(),
+            "workers": self.bk_workers_var.get(),
+            "anon": self.bk_anon_var.get(),
+            "sender_block": self.bk_sender_block_var.get().strip(),
+            "sender_allow": self.bk_sender_allow_var.get().strip(),
+            "kw_block": self.bk_kw_block_var.get().strip(),
+            "kw_allow": self.bk_kw_allow_var.get().strip(),
+            "date_from": self.bk_date_from_var.get().strip(),
+            "date_to": self.bk_date_to_var.get().strip(),
         }
         try:
             with open(core.CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -1014,9 +1330,12 @@ class App:
         self.mode = mode
         self.cancel_btn.config(state="enabled" if mode in ("scan", "download") else "disabled")
         self.copy_cancel_btn.config(state="enabled" if mode == "copy" else "disabled")
+        self.bk_cancel_btn.config(state="enabled" if mode in ("backup",) else "disabled")
         self.login_btn.config(state="enabled" if mode is None else "disabled")
         self.tdata_btn.config(state="enabled" if mode is None else "disabled")
         self.copy_btn.config(state="enabled" if mode is None else "disabled")
+        self.bk_scan_btn.config(state="enabled" if mode is None else "disabled")
+        self.bk_export_btn.config(state="enabled" if mode is None else "disabled")
         self.scan_btn.config(state="enabled" if (mode is None and self.authed) else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (mode is None and self.entries) else "disabled")
@@ -1028,6 +1347,9 @@ class App:
         elif mode == "copy":
             self.status_var.set("复制中…")
             self.copy_progressbar.config(value=0)
+        elif mode == "backup":
+            self.status_var.set("备份处理中…")
+            self.bk_progressbar.config(value=0)
         else:
             self.status_var.set("准备下载…")
             self.progress.config(value=0)
@@ -1036,9 +1358,12 @@ class App:
         self.mode = None
         self.cancel_btn.config(state="disabled")
         self.copy_cancel_btn.config(state="disabled")
+        self.bk_cancel_btn.config(state="disabled")
         self.login_btn.config(state="enabled")
         self.tdata_btn.config(state="enabled")
         self.copy_btn.config(state="enabled" if self.authed else "disabled")
+        self.bk_scan_btn.config(state="enabled" if self.authed else "disabled")
+        self.bk_export_btn.config(state="enabled" if self.authed else "disabled")
         self.scan_btn.config(state="enabled" if self.authed else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (self.authed and self.entries) else "disabled")
@@ -1130,6 +1455,34 @@ class App:
                     f"，受保护跳过 {stats.get('skipped_protected', 0)}，失败 {stats.get('failed', 0)}。")
                 if stats.get("copied"):
                     self.copy_progressbar.config(value=100)
+        elif kind == "backup_planned":
+            entries, stats, title = item[1], item[2], item[3]
+            self._set_idle()
+            self.bk_export_btn.config(state="enabled")
+            self._fill_backup_preview(entries)
+            self._append_log(
+                f"备份预览：{title}，过滤排序后 {len(entries)} 条，"
+                f"媒体 {stats.get('media_cnt', 0)} 个 / "
+                f"{core.human_size(stats.get('media_bytes', 0))}"
+                f"（过滤排除 {stats.get('filtered_out', 0)}）。确认无误后点【开始导出】。")
+        elif kind == "backup_progress":
+            pct, text = item[1], item[2]
+            self.bk_progressbar.config(value=min(float(pct or 0), 100))
+            self.status_var.set(f"备份中 {text}")
+        elif kind == "backup_done":
+            stats = item[1]
+            self._set_idle()
+            if stats:
+                out = stats.get("out", "")
+                self._append_log(
+                    f"备份完成：{stats.get('title', '')}，消息 {stats.get('scanned', 0) - stats.get('filtered_out', 0)} 条，"
+                    f"媒体 {stats.get('media_ok', stats.get('media_cnt', 0))}/{stats.get('media_cnt', 0)} 就绪"
+                    + (f"，输出：{out}" if out else ""))
+                if stats.get("mode") == "files" and out:
+                    self._append_log("双击目录里的 index.html 即可像看聊天记录一样浏览。")
+                if stats.get("zip_files"):
+                    self._append_log("压缩包：" + "；".join(stats["zip_files"]))
+                self.bk_progressbar.config(value=100)
         elif kind == "need_code":
             self._append_log("请输入验证码，然后点【提交验证码】。")
             self.code_entry.focus_set()

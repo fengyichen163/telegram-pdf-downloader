@@ -121,8 +121,12 @@ def _sender_meta(msg):
     return sid, name, uname, False
 
 
-async def _build_plan(client, src_entity, limit, log, cancelled):
-    """遍历源消息产出轻量计划条目（不含 Message 对象，万级消息内存占用很小）。"""
+async def _build_plan(client, src_entity, limit, log, cancelled, msgs_out=None):
+    """遍历源消息产出轻量计划条目（不含 Message 对象，万级消息内存占用很小）。
+
+    msgs_out 传 dict 时会顺带保存 id→Message 映射（本地备份需要原始对象
+    下载媒体/取格式实体；复制功能用不到就不存，省内存）。
+    """
     plan = []
     scanned = 0
     async for msg in client.iter_messages(src_entity, limit=limit or None):
@@ -140,11 +144,17 @@ async def _build_plan(client, src_entity, limit, log, cancelled):
         nm = (f.name or "") if f else ""
         ext = nm.rsplit(".", 1)[1].lower() if "." in nm else ""
         sid, name, uname, anon = _sender_meta(msg)
+        text = msg.message or ""
+        if getattr(msg, "poll", None):
+            text = f"[投票] {msg.poll.question}"
+        if msgs_out is not None:
+            msgs_out[msg.id] = msg
         plan.append({
             "id": msg.id, "gid": msg.grouped_id,
             "date": msg.date.date().isoformat() if msg.date else "",
+            "time": msg.date.strftime("%H:%M") if msg.date else "",
             "size": size, "uid": uid, "ext": ext, "has_media": has_media,
-            "text": msg.message or "",
+            "text": text,
             "reply_id": msg.reply_to_msg_id,
             "sender_id": sid, "sender_name": name,
             "sender_username": uname, "anonymous": anon,

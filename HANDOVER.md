@@ -40,6 +40,9 @@
 | `filters.py` | 消息过滤引擎（成员黑白名单/无署名/关键词含正则/媒体类型/日期），纯函数，复制与备份共用 |
 | `mirror_core.py` | 频道/群复制引擎：新建频道/群、服务端批量转发（drop_author 去头）、noforwards 回退下载重传（≤2GB）、断点续传（copy_progress/）、去重（目标扫描 + copy_dedup.sqlite3 全局库）、重建回复引用（可选逐条模式） |
 | `copy_chat_cli.py` | 复制命令行版（--new-channel/--new-group/--to + 过滤排序去重参数 + --dry-run） |
+| `export_html.py` | 本地备份显示层：聊天式 HTML 渲染（气泡/日期分隔/回复引用本地锚点跳转/图片视频音频标签），UTF-16 码元处理实体偏移，分页（默认 500 条/页） |
+| `backup_core.py` | 本地备份编排：plan_backup（扫描+过滤+排序+顺序命名）→ download_entries 下载媒体（增量=同大小跳过）→ render → files/zip/volumes 三形态打包（分卷每卷自包含，默认 3.8GB） |
+| `backup_cli.py` | 备份命令行版（-o 目录 --mode files/zip/volumes + 过滤排序 + --dry-run） |
 | `pdf_downloader_gui.py` | tkinter 界面。线程模型：Tk 主线程 + 后台 threading.Thread（内部 `asyncio.run`）+ `queue.Queue` 消息泵（`_poll` 每 100ms）|
 | `pdf_downloader_cli.py` | 命令行版，参数：`chat, -o, -n, -w, --ext, --search, --list-only, --api-id/--api-hash/--phone` |
 | `convert_tdata.py` | 把 Telegram Desktop/AyuGram 的 tdata 解密并转成 Telethon 会话（**自研解析，见 §6**）；`--tdata` 缺省时经 `find_tdata` 自动探测 |
@@ -122,6 +125,9 @@ need_code/need_password/authed/not_authed`。改回调签名时两端要同步�
     api_id/api_hash/phone 改为"空值保留旧值"——否则 tdata 转换好的配置会被一次空输入框的
     保存冲掉，启动静默检查（条件是 api 字段非空）不跑，症状是"转换明明成功，GUI 却一直
     未检查/未登录"。静默检查条件已放宽为：api 字段非空 **或** session 文件存在。
+11. **同一 session 文件不能被两个进程同时用（2026-10-07 记）**：SQLiteSession 打开即占库，
+    GUI 和 CLI 同时跑会报 `sqlite3.OperationalError: database is locked`。规避：CLI 用
+    会话副本（cp session 一份改名即可，授权密钥相同），或错峰使用；GUI 空闲时不占锁。
 
 ## 7. 环境与依赖
 
@@ -151,6 +157,14 @@ copy_chat_cli.py @源 --to @我的频道 --order size_desc      :: 复制到已�
 copy_chat_cli.py @源 --new-group "群" --sender-block "@某人" --anon exclude
 :: 重跑=增量同步（进度在 copy_progress/，换目标或强制重来就删对应 json）；
 :: GUI 选项卡：③ 频道复制，注意大批量复制有限流/风控风险，先 --dry-run 和小频道试。
+
+:: 本地备份（GUI 选项卡④，含纯文本消息，聊天式 HTML 可预览过滤排序结果）：
+backup_cli.py @源 -o D:\bak --dry-run                      :: 只扫描统计
+backup_cli.py @源 -o D:\bak                                :: 散件式：media/ 序号命名 + index.html 聊天视图
+backup_cli.py @源 -o D:\bak --mode zip                     :: 单压缩包（zip64，超大也行）
+backup_cli.py @源 -o D:\bak --mode volumes --vol-gb 3.8    :: 分卷，每卷自包含可单独解压看
+:: 增量：时间正序下重跑只补新消息（同大小跳过）；改过滤/排序会重排序号=重新导出。
+:: 同一 session 别双进程同时用（database is locked），CLI 可用会话副本规避。
 
 :: CLI 示例
 python pdf_downloader_cli.py @chan                     :: 默认只下 pdf
