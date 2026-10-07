@@ -235,6 +235,33 @@ class TdataDownloadWorker(threading.Thread):
             self.q.put(("tdata_dl_done", False, str(e)))
 
 
+class CopyWorker(threading.Thread):
+    """频道复制（mirror_core.copy_chat）。cancel 支持批次间取消。"""
+
+    def __init__(self, api_id, api_hash, src, dest, opts, q):
+        super().__init__(daemon=True)
+        self.api_id, self.api_hash = api_id, api_hash
+        self.src, self.dest, self.opts = src, dest, opts
+        self.q = q
+        self.cancel = False
+
+    def run(self):
+        try:
+            import asyncio
+            import mirror_core
+            stats = asyncio.run(mirror_core.copy_chat(
+                self.api_id, self.api_hash, self.src, self.dest, self.opts,
+                log=lambda t: self.q.put(("log", t)),
+                on_progress=lambda d, tot, txt: self.q.put(
+                    ("copy_progress", d, tot, txt)),
+                cancelled=lambda: self.cancel))
+            self.q.put(("copy_done", stats))
+        except Exception as e:
+            core.log_file(traceback.format_exc())
+            self.q.put(("error", f"复制失败：{e}{core.connection_hint(e)}"))
+            self.q.put(("copy_done", None))
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -251,11 +278,19 @@ class App:
         self.visible = []       # 当前筛选条件下显示的条目下标
         self.checked = set()    # 勾选的条目下标
 
-        main = ttk.Frame(root, padding=8)
+        main = ttk.Frame(root, padding=(8, 8, 8, 0))
         main.pack(fill="both", expand=True)
+        self.nb = ttk.Notebook(main)
+        self.nb.pack(fill="both", expand=True)
+        tab_login = ttk.Frame(self.nb, padding=8)
+        tab_dl = ttk.Frame(self.nb, padding=8)
+        tab_copy = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab_login, text="① 登录")
+        self.nb.add(tab_dl, text="② 扫描 / 下载")
+        self.nb.add(tab_copy, text="③ 频道复制")
 
         # ---------- ① 登录区 ----------
-        lf = ttk.LabelFrame(main, text="① 登录（首次使用需配置，之后自动记住）", padding=6)
+        lf = ttk.LabelFrame(tab_login, text="登录（首次使用需配置，之后自动记住）", padding=6)
         lf.pack(fill="x")
         lf.columnconfigure(1, weight=1)
 
@@ -307,7 +342,7 @@ class App:
         ttk.Button(vrow, text="提交密码", command=self.on_submit_password).pack(side="left")
 
         # ---------- ② 扫描 ----------
-        sf = ttk.LabelFrame(main, text="② 扫描群/频道文件（文档/视频/音频/图片）", padding=6)
+        sf = ttk.LabelFrame(tab_dl, text="扫描群/频道文件（文档/视频/音频/图片）", padding=6)
         sf.pack(fill="x", pady=(6, 0))
         sf.columnconfigure(1, weight=1)
 
@@ -338,7 +373,7 @@ class App:
         self.scan_btn.pack(side="left")
 
         # ---------- ③ 筛选 + 列表 + 下载 ----------
-        df = ttk.LabelFrame(main, text="③ 筛选 / 勾选 / 下载", padding=6)
+        df = ttk.LabelFrame(tab_dl, text="筛选 / 勾选 / 下载", padding=6)
         df.pack(fill="both", expand=True, pady=(6, 0))
         df.columnconfigure(0, weight=1)
         df.rowconfigure(2, weight=1)
@@ -393,15 +428,16 @@ class App:
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(df, textvariable=self.status_var, foreground="#333").grid(row=5, column=0, columnspan=2, sticky="w")
 
-        # ---------- 日志 ----------
-        lf2 = ttk.LabelFrame(main, text="日志", padding=4)
-        lf2.pack(fill="both", expand=True, pady=(6, 0))
+        # ---------- 日志（窗口底部，各选项卡共用） ----------
+        lf2 = ttk.LabelFrame(root, text="日志", padding=4)
+        lf2.pack(fill="x", padx=8, pady=(4, 8))
         self.log_text = tk.Text(lf2, height=8, state="disabled", wrap="word", font=("Consolas", 9))
         lys = ttk.Scrollbar(lf2, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=lys.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         lys.pack(side="right", fill="y")
 
+        self._build_copy_tab(tab_copy)
         self._load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(100, self._poll)
@@ -409,6 +445,193 @@ class App:
         if ((self.api_id_var.get() and self.api_hash_var.get())
                 or os.path.exists(core.SESSION_PATH + ".session")):
             self._start_login(interactive=False)  # 启动时静默检查已保存的会话
+
+    # ---------- ③ 频道复制 ----------
+    def _build_copy_tab(self, tab):
+        tab.columnconfigure(1, weight=1)
+        r = 0
+
+        ttk.Label(tab, text="源群/频道:").grid(row=r, column=0, sticky="e")
+        self.copy_src_var = tk.StringVar()
+        ttk.Entry(tab, textvariable=self.copy_src_var).grid(
+            row=r, column=1, sticky="we")
+        ttk.Label(tab, text="@用户名 / t.me / 数字ID", foreground="#888").grid(
+            row=r, column=2, sticky="w")
+        r += 1
+
+        ttk.Label(tab, text="复制到:").grid(row=r, column=0, sticky="e")
+        drow = ttk.Frame(tab)
+        drow.grid(row=r, column=1, columnspan=2, sticky="we")
+        self.copy_dest_mode_var = tk.StringVar(value="new")
+        ttk.Radiobutton(drow, text="新建", variable=self.copy_dest_mode_var,
+                        value="new", command=self._copy_dest_mode_changed).pack(side="left")
+        self.copy_kind_var = tk.StringVar(value="频道")
+        self.copy_kind_box = ttk.Combobox(drow, textvariable=self.copy_kind_var,
+                                          values=["频道", "群"], width=5, state="readonly")
+        self.copy_kind_box.pack(side="left", padx=(8, 0))
+        self.copy_title_var = tk.StringVar()
+        self.copy_title_entry = ttk.Entry(drow, textvariable=self.copy_title_var, width=22)
+        self.copy_title_entry.pack(side="left", padx=(8, 0))
+        ttk.Label(drow, text="标题").pack(side="left", padx=(2, 10))
+        self.copy_dest_var = tk.StringVar()
+        self.copy_dest_entry = ttk.Entry(drow, textvariable=self.copy_dest_var, width=30)
+        ttk.Label(drow, text="或填已有:", foreground="#888").pack(side="left", padx=(2, 0))
+        self.copy_dest_entry.pack(side="left", padx=(4, 0))
+        r += 1
+
+        ttk.Label(tab, text="简介(可选):").grid(row=r, column=0, sticky="e")
+        self.copy_about_var = tk.StringVar()
+        ttk.Entry(tab, textvariable=self.copy_about_var).grid(row=r, column=1, sticky="we")
+        r += 1
+
+        orow = ttk.Frame(tab)
+        orow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        self.copy_drop_author = tk.BooleanVar(value=True)
+        ttk.Checkbutton(orow, text="署名是我（去转发头）",
+                        variable=self.copy_drop_author).pack(side="left")
+        self.copy_rebuild = tk.BooleanVar(value=False)
+        ttk.Checkbutton(orow, text="重建回复引用（逐条发送，慢）",
+                        variable=self.copy_rebuild).pack(side="left", padx=(10, 0))
+        self.copy_dedup_dest = tk.BooleanVar(value=True)
+        ttk.Checkbutton(orow, text="跳过目标已有同文件",
+                        variable=self.copy_dedup_dest).pack(side="left", padx=(10, 0))
+        self.copy_dedup_global = tk.BooleanVar(value=True)
+        ttk.Checkbutton(orow, text="全局去重库",
+                        variable=self.copy_dedup_global).pack(side="left", padx=(10, 0))
+        self.copy_dry_run = tk.BooleanVar(value=False)
+        ttk.Checkbutton(orow, text="试运行（只统计不发送）",
+                        variable=self.copy_dry_run).pack(side="left", padx=(10, 0))
+        r += 1
+
+        ttk.Label(tab, text="排序:").grid(row=r, column=0, sticky="e")
+        srow = ttk.Frame(tab)
+        srow.grid(row=r, column=1, columnspan=2, sticky="w")
+        self.copy_order_var = tk.StringVar(value="时间正序")
+        ttk.Combobox(srow, textvariable=self.copy_order_var, width=10, state="readonly",
+                     values=["时间正序", "时间倒序", "大小正序", "大小倒序"]).pack(side="left")
+        ttk.Label(srow, text="   数量上限:").pack(side="left")
+        self.copy_limit_var = tk.IntVar(value=0)
+        ttk.Spinbox(srow, from_=0, to=10 ** 9, textvariable=self.copy_limit_var,
+                    width=9).pack(side="left")
+        ttk.Label(srow, text="0=全部", foreground="#888").pack(side="left")
+        r += 1
+
+        frow = ttk.Frame(tab)
+        frow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(6, 0))
+        ttk.Label(frow, text="成员排除:").pack(side="left")
+        self.copy_sender_block_var = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.copy_sender_block_var, width=22).pack(side="left", padx=(2, 10))
+        ttk.Label(frow, text="成员只留:").pack(side="left")
+        self.copy_sender_allow_var = tk.StringVar()
+        ttk.Entry(frow, textvariable=self.copy_sender_allow_var, width=22).pack(side="left", padx=(2, 10))
+        ttk.Label(frow, text="无署名:").pack(side="left")
+        self.copy_anon_var = tk.StringVar(value="全部保留")
+        ttk.Combobox(frow, textvariable=self.copy_anon_var, width=10, state="readonly",
+                     values=["全部保留", "排除无署名", "仅保留有署名"]).pack(side="left")
+        ttk.Label(frow, text="（ID/@用户名/昵称，逗号分隔）", foreground="#888").pack(side="left", padx=(8, 0))
+        r += 1
+
+        krow = ttk.Frame(tab)
+        krow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(4, 0))
+        ttk.Label(krow, text="关键词排除:").pack(side="left")
+        self.copy_kw_block_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.copy_kw_block_var, width=26).pack(side="left", padx=(2, 10))
+        ttk.Label(krow, text="关键词只留:").pack(side="left")
+        self.copy_kw_allow_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.copy_kw_allow_var, width=26).pack(side="left", padx=(2, 10))
+        ttk.Label(krow, text="时间从:").pack(side="left")
+        self.copy_date_from_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.copy_date_from_var, width=11).pack(side="left", padx=(2, 4))
+        ttk.Label(krow, text="到").pack(side="left")
+        self.copy_date_to_var = tk.StringVar()
+        ttk.Entry(krow, textvariable=self.copy_date_to_var, width=11).pack(side="left", padx=(4, 0))
+        ttk.Label(krow, text="（regex:前缀=正则；日期 2024-01-01）", foreground="#888").pack(side="left", padx=(8, 0))
+        r += 1
+
+        brow = ttk.Frame(tab)
+        brow.grid(row=r, column=0, columnspan=3, sticky="we", pady=(8, 0))
+        self.copy_btn = ttk.Button(brow, text="开始复制", command=self.on_copy_start)
+        self.copy_btn.pack(side="left")
+        self.copy_cancel_btn = ttk.Button(brow, text="取消", command=self.on_cancel,
+                                          state="disabled")
+        self.copy_cancel_btn.pack(side="left", padx=6)
+        ttk.Label(brow, textvariable=self.status_var, foreground="#333").pack(side="left", padx=10)
+        r += 1
+
+        self.copy_progressbar = ttk.Progressbar(tab, maximum=100)
+        self.copy_progressbar.grid(row=r, column=0, columnspan=3, sticky="we", pady=(6, 0))
+
+    def _copy_dest_mode_changed(self):
+        new_mode = self.copy_dest_mode_var.get() == "new"
+        self.copy_kind_box.config(state="readonly" if new_mode else "disabled")
+        self.copy_title_entry.config(state="normal" if new_mode else "disabled")
+        self.copy_dest_entry.config(state="disabled" if new_mode else "normal")
+
+    def _copy_rules(self):
+        def split(s):
+            return [x.strip() for x in (s or "").replace("，", ",").split(",") if x.strip()]
+
+        anon_map = {"全部保留": "keep", "排除无署名": "exclude", "仅保留有署名": "only"}
+        return {
+            "sender_block": split(self.copy_sender_block_var.get()),
+            "sender_allow": split(self.copy_sender_allow_var.get()),
+            "anonymous": anon_map.get(self.copy_anon_var.get(), "keep"),
+            "keyword_block": split(self.copy_kw_block_var.get()),
+            "keyword_allow": split(self.copy_kw_allow_var.get()),
+            "media": "all",
+            "exts": [],
+            "date_from": self.copy_date_from_var.get().strip(),
+            "date_to": self.copy_date_to_var.get().strip(),
+        }
+
+    def on_copy_start(self):
+        if self.mode or not self.authed:
+            return
+        src = self.copy_src_var.get().strip()
+        if not src:
+            messagebox.showerror("提示", "请填写源群/频道。")
+            return
+        if self.copy_dest_mode_var.get() == "new":
+            title = self.copy_title_var.get().strip()
+            if not title:
+                messagebox.showerror("提示", "新建目标需要标题。")
+                return
+            kind = "group" if self.copy_kind_var.get() == "群" else "channel"
+            dest = ("new", kind, title, self.copy_about_var.get().strip())
+        else:
+            dest_chat = self.copy_dest_var.get().strip()
+            if not dest_chat:
+                messagebox.showerror("提示", "请填写已有频道/群的 @用户名 或数字 ID。")
+                return
+            dest = ("existing", dest_chat)
+        for dfld, dtxt in ((self.copy_date_from_var, "时间从"),
+                           (self.copy_date_to_var, "时间到")):
+            v = dfld.get().strip()
+            if v and len(v.split("-")) != 3:
+                messagebox.showerror("提示", f"{dtxt} 日期格式应为 2024-01-01。")
+                return
+        opts = {
+            "rules": self._copy_rules(),
+            "order": {"时间正序": "time_asc", "时间倒序": "time_desc",
+                      "大小正序": "size_asc", "大小倒序": "size_desc"}[
+                          self.copy_order_var.get()],
+            "drop_author": self.copy_drop_author.get(),
+            "rebuild_replies": self.copy_rebuild.get(),
+            "dedup_dest": self.copy_dedup_dest.get(),
+            "dedup_global": self.copy_dedup_global.get(),
+            "limit": self.copy_limit_var.get(),
+            "dry_run": self.copy_dry_run.get(),
+        }
+        if not self._save_config():
+            return
+        self._set_busy("copy")
+        try:
+            api_id = int(self.api_id_var.get().strip())
+        except ValueError:
+            api_id = None
+        self.worker = CopyWorker(api_id, self.api_hash_var.get().strip() or None,
+                                 src, dest, opts, self.q)
+        self.worker.start()
 
     # ---------- 配置 ----------
     def _load_config(self):
@@ -437,6 +660,31 @@ class App:
             detected = core.detect_proxy()
             if detected:
                 self.proxy_var.set(f"{detected['host']}:{detected['port']}")
+        c = cfg.get("copy") or {}
+        if c:
+            self.copy_src_var.set(c.get("src", "") or "")
+            self.copy_dest_mode_var.set(c.get("dest_mode", "new") or "new")
+            self.copy_kind_var.set(c.get("kind", "频道") or "频道")
+            self.copy_title_var.set(c.get("title", "") or "")
+            self.copy_about_var.set(c.get("about", "") or "")
+            self.copy_dest_var.set(c.get("dest_chat", "") or "")
+            self.copy_order_var.set(c.get("order", "时间正序") or "时间正序")
+            self.copy_drop_author.set(bool(c.get("drop_author", True)))
+            self.copy_rebuild.set(bool(c.get("rebuild", False)))
+            self.copy_dedup_dest.set(bool(c.get("dedup_dest", True)))
+            self.copy_dedup_global.set(bool(c.get("dedup_global", True)))
+            self.copy_anon_var.set(c.get("anon", "全部保留") or "全部保留")
+            self.copy_sender_block_var.set(c.get("sender_block", "") or "")
+            self.copy_sender_allow_var.set(c.get("sender_allow", "") or "")
+            self.copy_kw_block_var.set(c.get("kw_block", "") or "")
+            self.copy_kw_allow_var.set(c.get("kw_allow", "") or "")
+            self.copy_date_from_var.set(c.get("date_from", "") or "")
+            self.copy_date_to_var.set(c.get("date_to", "") or "")
+            try:
+                self.copy_limit_var.set(int(c.get("limit", 0) or 0))
+            except (TypeError, ValueError):
+                self.copy_limit_var.set(0)
+            self._copy_dest_mode_changed()
 
     def _save_config(self):
         # 先读旧配置做合并，避免弄丢 convert_tdata.py 等写入的字段（如 proxy）
@@ -463,6 +711,27 @@ class App:
             cfg["proxy"] = proxy
         else:
             cfg.pop("proxy", None)
+        cfg["copy"] = {
+            "src": self.copy_src_var.get().strip(),
+            "dest_mode": self.copy_dest_mode_var.get(),
+            "kind": self.copy_kind_var.get(),
+            "title": self.copy_title_var.get().strip(),
+            "about": self.copy_about_var.get().strip(),
+            "dest_chat": self.copy_dest_var.get().strip(),
+            "order": self.copy_order_var.get(),
+            "drop_author": bool(self.copy_drop_author.get()),
+            "rebuild": bool(self.copy_rebuild.get()),
+            "dedup_dest": bool(self.copy_dedup_dest.get()),
+            "dedup_global": bool(self.copy_dedup_global.get()),
+            "anon": self.copy_anon_var.get(),
+            "sender_block": self.copy_sender_block_var.get().strip(),
+            "sender_allow": self.copy_sender_allow_var.get().strip(),
+            "kw_block": self.copy_kw_block_var.get().strip(),
+            "kw_allow": self.copy_kw_allow_var.get().strip(),
+            "date_from": self.copy_date_from_var.get().strip(),
+            "date_to": self.copy_date_to_var.get().strip(),
+            "limit": self.copy_limit_var.get(),
+        }
         try:
             with open(core.CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -744,8 +1013,10 @@ class App:
     def _set_busy(self, mode):
         self.mode = mode
         self.cancel_btn.config(state="enabled" if mode in ("scan", "download") else "disabled")
+        self.copy_cancel_btn.config(state="enabled" if mode == "copy" else "disabled")
         self.login_btn.config(state="enabled" if mode is None else "disabled")
         self.tdata_btn.config(state="enabled" if mode is None else "disabled")
+        self.copy_btn.config(state="enabled" if mode is None else "disabled")
         self.scan_btn.config(state="enabled" if (mode is None and self.authed) else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (mode is None and self.entries) else "disabled")
@@ -754,6 +1025,9 @@ class App:
         elif mode == "scan":
             self.status_var.set("扫描中…（消息多时需要几分钟）")
             self.progress.config(value=0)
+        elif mode == "copy":
+            self.status_var.set("复制中…")
+            self.copy_progressbar.config(value=0)
         else:
             self.status_var.set("准备下载…")
             self.progress.config(value=0)
@@ -761,8 +1035,10 @@ class App:
     def _set_idle(self):
         self.mode = None
         self.cancel_btn.config(state="disabled")
+        self.copy_cancel_btn.config(state="disabled")
         self.login_btn.config(state="enabled")
         self.tdata_btn.config(state="enabled")
+        self.copy_btn.config(state="enabled" if self.authed else "disabled")
         self.scan_btn.config(state="enabled" if self.authed else "disabled")
         for b in (self.dl_sel_btn, self.dl_vis_btn):
             b.config(state="enabled" if (self.authed and self.entries) else "disabled")
@@ -839,6 +1115,21 @@ class App:
                 messagebox.showerror(
                     "出错了", f"下载失败：{msg}\n"
                     "可手动从 telegram.org 下载便携版解压后，用【手动选择 tdata 目录】重试。")
+        elif kind == "copy_progress":
+            done, total, text = item[1], item[2], item[3]
+            pct = done / total * 100 if total else 100
+            self.copy_progressbar.config(value=min(pct, 100))
+            self.status_var.set(f"复制中 [{done}/{total}] {text}")
+        elif kind == "copy_done":
+            stats = item[1]
+            self._set_idle()
+            if stats:
+                self._append_log(
+                    f"复制结束：目标 {stats.get('dest_desc', '')}，发送 {stats.get('copied', 0)}"
+                    f"，去重跳过 {stats.get('skipped_dedup', 0)}，过滤排除 {stats.get('filtered_out', 0)}"
+                    f"，受保护跳过 {stats.get('skipped_protected', 0)}，失败 {stats.get('failed', 0)}。")
+                if stats.get("copied"):
+                    self.copy_progressbar.config(value=100)
         elif kind == "need_code":
             self._append_log("请输入验证码，然后点【提交验证码】。")
             self.code_entry.focus_set()

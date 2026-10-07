@@ -37,6 +37,9 @@
 | 文件 | 职责 |
 | --- | --- |
 | `core.py` | 全部核心逻辑：代理探测/解析、make_client、登录流、run_scan、filter_entries、download_entries、run_download(扫描+筛选+下载的 CLI 便捷封装) |
+| `filters.py` | 消息过滤引擎（成员黑白名单/无署名/关键词含正则/媒体类型/日期），纯函数，复制与备份共用 |
+| `mirror_core.py` | 频道/群复制引擎：新建频道/群、服务端批量转发（drop_author 去头）、noforwards 回退下载重传（≤2GB）、断点续传（copy_progress/）、去重（目标扫描 + copy_dedup.sqlite3 全局库）、重建回复引用（可选逐条模式） |
+| `copy_chat_cli.py` | 复制命令行版（--new-channel/--new-group/--to + 过滤排序去重参数 + --dry-run） |
 | `pdf_downloader_gui.py` | tkinter 界面。线程模型：Tk 主线程 + 后台 threading.Thread（内部 `asyncio.run`）+ `queue.Queue` 消息泵（`_poll` 每 100ms）|
 | `pdf_downloader_cli.py` | 命令行版，参数：`chat, -o, -n, -w, --ext, --search, --list-only, --api-id/--api-hash/--phone` |
 | `convert_tdata.py` | 把 Telegram Desktop/AyuGram 的 tdata 解密并转成 Telethon 会话（**自研解析，见 §6**）；`--tdata` 缺省时经 `find_tdata` 自动探测 |
@@ -140,6 +143,14 @@ download_pdfs.bat  →  已登录✔  →  填群/频道  →  扫描文件列�
 ::   自动探测本机 tdata（进程/快捷方式/注册表/默认路径），找不到时 GUI 给三分支：
 ::   手动选 tdata 目录 / 帮装 Telegram 便携版（tg.org zip 走系统代理解压到工具旁 Telegram\）
 ::   / 改用验证码登录。控制台手动指定：convert_tdata.py --tdata "AyuGram安装目录\tdata"
+
+:: 频道/群复制（GUI 选项卡③，或命令行）：
+copy_chat_cli.py @源 --new-channel "标题" --dry-run        :: 先试运行只统计
+copy_chat_cli.py @源 --new-channel "标题"                  :: 复制到新建频道（署名是我）
+copy_chat_cli.py @源 --to @我的频道 --order size_desc      :: 复制到已有频道，按大小倒序
+copy_chat_cli.py @源 --new-group "群" --sender-block "@某人" --anon exclude
+:: 重跑=增量同步（进度在 copy_progress/，换目标或强制重来就删对应 json）；
+:: GUI 选项卡：③ 频道复制，注意大批量复制有限流/风控风险，先 --dry-run 和小频道试。
 
 :: CLI 示例
 python pdf_downloader_cli.py @chan                     :: 默认只下 pdf
